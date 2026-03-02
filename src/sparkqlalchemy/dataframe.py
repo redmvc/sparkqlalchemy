@@ -1,0 +1,1232 @@
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, TypeVar, cast
+
+from sqlalchemy import CursorResult, and_, literal, union_all
+from sqlalchemy import delete as sa_delete
+from sqlalchemy import func as sa_func
+from sqlalchemy import inspect as sa_inspect
+from sqlalchemy import select as sa_select
+from sqlalchemy import update as sa_update
+from sqlalchemy.orm import Session, aliased
+from sqlalchemy.sql.elements import Label
+from sqlalchemy.sql.util import ClauseAdapter
+
+from . import functions as F
+from .column import Column
+
+if TYPE_CHECKING:
+    from typing import Any
+
+    from sqlalchemy import CompoundSelect, Select, Table
+
+    from .column import SQLExpr
+
+T = TypeVar("T")
+
+
+@dataclass(frozen=True)
+class Row:
+    """A lightweight result row with attribute, index, and dict access."""
+
+    _data: dict[str, "Any"]
+
+    def __init__(self, mapping: dict[str, "Any"]):
+        # Use `object.__setattr__` to ensure immutability, and `dict(mapping)` to make it a copy of the dictionary.
+        object.__setattr__(self, "_data", dict(mapping))
+
+    @property
+    def _keys(self) -> list[str]:
+        return list(self._data.keys())
+
+    def __getattr__(self, name: str) -> "Any":
+        try:
+            return self._data[name]
+        except KeyError:
+            raise AttributeError(f"Row has no column '{name}'") from None
+
+    def __getitem__(self, key: str | int) -> "Any":
+        if isinstance(key, int):
+            return self._data[self._keys[key]]
+        return self._data[key]
+
+    def asDict(self) -> dict:
+        return dict(self._data)
+
+    def __repr__(self) -> str:
+        pairs = ", ".join(f"{k}={v!r}" for k, v in self._data.items())
+        return f"Row({pairs})"
+
+    def __eq__(self, other: object) -> bool:
+        if isinstance(other, Row):
+            return self._data == other._data
+        return NotImplemented
+
+    def __len__(self) -> int:
+        return len(self._data)
+
+
+class GroupedData[T]:
+    """An intermediate object returned by :meth:`DataFrame.groupBy`.
+
+    The only meaningful operation is :meth:`agg`, which returns a new :class:`DataFrame` with the grouping columns plus aggregated columns.
+    """
+
+    def __init__(self, df: "DataFrame[T]", group_exprs: list["SQLExpr"]):
+        self._df = df
+        self._group_exprs = group_exprs  # already-resolved SA expressions
+
+    def agg(self, *exprs: str | Column) -> "DataFrame[T]":
+        """Apply aggregate expressions and return a new :class:`DataFrame`.
+
+        Parameters
+        ----------
+        *exprs : str | :class:`Column`
+            Aggregate column expressions (e.g. `F.sum("salary").alias("total")`).
+
+        Returns
+        -------
+        :class:`DataFrame`
+        """
+        new = self._df._build_agg(exprs, initial_entities=self._group_exprs)
+        new._group_by_clauses = list(self._group_exprs)
+        return new
+
+    def count(self) -> "DataFrame[T]":
+        """Count the rows in each group and return a new :class:`DataFrame`.
+
+        Returns
+        -------
+        :class:`DataFrame`
+        """
+        return self.agg(F.count("*").alias("count"))
+
+    def sum(self, *cols: str) -> "DataFrame[T]":
+        """Sum one or more columns within each group and return a new :class:`DataFrame`.
+
+        Parameters
+        ----------
+        *cols : str
+            Names of the columns to sum.
+
+        Returns
+        -------
+        :class:`DataFrame`
+        """
+        return self.agg(*(F.sum(c).alias(f"sum({c})") for c in cols))
+
+    def avg(self, *cols: str) -> "DataFrame[T]":
+        """Average one or more columns within each group and return a new :class:`DataFrame`.
+
+        Parameters
+        ----------
+        *cols : str
+            Names of the columns to average.
+
+        Returns
+        -------
+        :class:`DataFrame`
+        """
+        return self.agg(*(F.avg(c).alias(f"avg({c})") for c in cols))
+
+    def mean(self, *cols: str) -> "DataFrame[T]":
+        """Average one or more columns within each group and return a new :class:`DataFrame`.
+
+        Alias for :meth:`GroupedData.avg`.
+
+        Parameters
+        ----------
+        *cols : str
+            Names of the columns to average.
+
+        Returns
+        -------
+        :class:`DataFrame`
+        """
+        return self.avg(*cols)
+
+    def max(self, *cols: str) -> "DataFrame[T]":
+        """Return the maximum of one or more columns within each group as a new :class:`DataFrame`.
+
+        Parameters
+        ----------
+        *cols : str
+            Names of the columns to take the maximum of.
+
+        Returns
+        -------
+        :class:`DataFrame`
+        """
+        return self.agg(*(F.max(c).alias(f"max({c})") for c in cols))
+
+    def min(self, *cols: str) -> "DataFrame[T]":
+        """Return the minimum of one or more columns within each group as a new :class:`DataFrame`.
+
+        Parameters
+        ----------
+        *cols : str
+            Names of the columns to take the minimum of.
+
+        Returns
+        -------
+        :class:`DataFrame`
+        """
+        return self.agg(*(F.min(c).alias(f"min({c})") for c in cols))
+
+
+class DataFrame[T]:
+    """A PySpark-style DataFrame backed by a SQLAlchemy ORM model.
+
+    All transformation methods return new :class:`DataFrame` instances (the
+    original is never mutated).  The underlying SQL query is only built and
+    executed when a terminal method is called (`collect`, `show`, `toPandas`,
+    `count`, `first`).
+
+    Parameters
+    ----------
+    session : :class:`~sqlalchemy.orm.Session`
+        An active SQLAlchemy ORM session.
+    model : type
+        An SQLAlchemy ORM mapped class.
+    """
+
+    def __init__(self, session: Session, model: type[T]):
+        self._session = session
+        self._model: type[T] = model
+        self._sa_entity: "Any" = model  # May be replaced by aliased(model) via .alias()
+        self._registry: dict[str, "SQLExpr | Column"] = {}
+        self._alias_name: str | None = None
+
+        # Populated by transformation methods
+        self._select_entities: list["SQLExpr"] | None = None  # None ⇒ "all"
+        self._where_clauses: list["SQLExpr"] = []
+        self._group_by_clauses: list["SQLExpr"] = []
+        self._having_clauses: list["SQLExpr"] = []
+        self._order_by_clauses: list["SQLExpr"] = []
+        self._joins: list[
+            tuple["Any", "SQLExpr | None", str]
+        ] = []  # (entity, on-clause, how)
+        self._is_distinct: bool = False
+        self._limit_val: int | None = None
+        self._offset_val: int | None = None
+        self._union_other: DataFrame | None = None
+
+        # Build initial column registry from the ORM model
+        self._init_registry(model)
+
+    def _init_registry(self, model: type):
+        mapper = sa_inspect(model)
+        for attr in mapper.column_attrs:
+            self._registry[attr.key] = getattr(self._sa_entity, attr.key)
+
+    def _clone(self) -> "DataFrame[T]":
+        new: DataFrame[T] = object.__new__(DataFrame)
+        new._session = self._session
+        new._model = self._model
+        new._sa_entity = self._sa_entity
+        new._registry = self._registry.copy()
+        new._alias_name = self._alias_name
+        new._select_entities = (
+            list(self._select_entities) if self._select_entities is not None else None
+        )
+        new._where_clauses = list(self._where_clauses)
+        new._group_by_clauses = list(self._group_by_clauses)
+        new._having_clauses = list(self._having_clauses)
+        new._order_by_clauses = list(self._order_by_clauses)
+        new._joins = list(self._joins)
+        new._is_distinct = self._is_distinct
+        new._limit_val = self._limit_val
+        new._offset_val = self._offset_val
+        new._union_other = self._union_other
+        return new
+
+    def _as_subquery(self) -> "DataFrame[T]":
+        """Wrap the current query as a SQL subquery and return a fresh DataFrame backed by it."""
+        subq = self._build_query().subquery()
+        new: DataFrame[T] = object.__new__(DataFrame)
+        new._session = self._session
+        new._model = self._model
+        new._sa_entity = subq
+        new._registry = {c.name: subq.c[c.name] for c in subq.columns}
+        new._alias_name = None
+        new._select_entities = None
+        new._where_clauses = []
+        new._group_by_clauses = []
+        new._having_clauses = []
+        new._order_by_clauses = []
+        new._joins = []
+        new._is_distinct = False
+        new._limit_val = None
+        new._offset_val = None
+        new._union_other = None
+        return new
+
+    def alias(self, name: str) -> "DataFrame[T]":
+        """Give this :class:`DataFrame` a table alias.
+
+        Creates a true :class:`~sqlalchemy.orm.util.AliasedClass` entity so
+        that self-joins and multi-table queries reference distinct table
+        instances.  After aliasing, every base-model column is accessible both
+        by its bare name and by the dot-qualified form `"alias.column"`.
+
+        Columns from prior joins, `withColumn`, or `withColumnRenamed` are
+        preserved.  Chaining aliases (`df.alias("a").alias("b")`) replaces
+        the previous alias cleanly.
+
+        Parameters
+        ----------
+        name : str
+            The alias name.
+
+        Returns
+        -------
+        :class:`DataFrame`
+        """
+        new = self._clone()
+        new._alias_name = name
+
+        # Create a real SA aliased entity so self-joins work
+        sa_alias = aliased(self._model, name=name)
+        new._sa_entity = sa_alias
+
+        # Build a ClauseAdapter that rewrites references from the old
+        # entity (whether the bare model table or a previous alias) to
+        # the new aliased table.  This keeps join conditions, WHERE
+        # clauses, ORDER BY, etc. consistent with the new alias.
+        old_selectable = sa_inspect(self._sa_entity).selectable
+        new_selectable = sa_inspect(sa_alias, raiseerr=True).selectable
+        adapter = ClauseAdapter(
+            new_selectable,
+            equivalents={
+                c: {new_selectable.c[c.key]}
+                for c in old_selectable.c
+                if c.key in new_selectable.c
+            },
+        )
+
+        def _adapt(expr: "Any") -> "Any":
+            """Adapt a SA expression, passing through non-SA objects unchanged."""
+            try:
+                return adapter.traverse(expr)
+            except AttributeError:
+                return expr
+
+        # Rewrite all stored clauses that may reference the old entity
+        new._where_clauses = [_adapt(c) for c in new._where_clauses]
+        new._group_by_clauses = [_adapt(c) for c in new._group_by_clauses]
+        new._having_clauses = [_adapt(c) for c in new._having_clauses]
+        new._order_by_clauses = [_adapt(c) for c in new._order_by_clauses]
+        new._joins = [
+            (entity, _adapt(cond) if cond is not None else None, how)
+            for entity, cond, how in new._joins
+        ]
+        if new._select_entities is not None:
+            new._select_entities = [_adapt(e) for e in new._select_entities]
+
+        # Determine which bare column names belong to the base model so we
+        # can replace them with the aliased versions while preserving
+        # everything else (joined columns, withColumn additions, etc.).
+        mapper = sa_inspect(self._model, raiseerr=True)
+        base_col_names = {attr.key for attr in mapper.column_attrs}
+
+        # Remove old base-model entries (bare and "Any" previous dot-prefix)
+        old_prefix = f"{self._alias_name}." if self._alias_name else None
+        keys_to_remove = set()
+        for key in new._registry:
+            if key in base_col_names:
+                keys_to_remove.add(key)
+            elif old_prefix and key.startswith(old_prefix):
+                keys_to_remove.add(key)
+        for key in keys_to_remove:
+            del new._registry[key]
+
+        # Adapt "Any" remaining registry entries (e.g. withColumn-computed
+        # expressions) that may still reference the old entity.
+        for key in list(new._registry.keys()):
+            new._registry[key] = _adapt(new._registry[key])
+
+        # Re-register base-model columns from the new aliased entity
+        for attr in mapper.column_attrs:
+            sa_col = getattr(sa_alias, attr.key)
+            new._registry[attr.key] = sa_col  # bare: "salary"
+            new._registry[f"{name}.{attr.key}"] = sa_col  # dotted: "a.salary"
+
+        return new
+
+    def _resolve(self, c: "Any") -> "SQLExpr":
+        """Resolve a column reference to a concrete SQLAlchemy expression using this DataFrame's registry."""
+        if isinstance(c, str):
+            if c == "*":
+                return literal(1)
+            if c not in self._registry:
+                raise KeyError(
+                    f"Column '{c}' not found. "
+                    f"Available: {sorted(self._registry.keys())}"
+                )
+            entry = self._registry[c]
+            # If the registry entry is itself a Col, resolve it
+            if isinstance(entry, Column):
+                return entry.resolve(self._registry)
+            return entry
+        if isinstance(c, Column):
+            return c.resolve(self._registry)
+        # Assume it's already a raw SA expression
+        return c
+
+    def __getitem__(self, name: str) -> Column:
+        """Return a :class:`Column` bound to a specific column in this :class:`DataFrame`. Useful for disambiguating columns after a join.
+
+        Parameters
+        ----------
+        name : str
+            The column name.
+
+        Returns
+        -------
+        :class:`Column`
+
+        Raises
+        ------
+        KeyError
+            `name` is not a column in this :class:`DataFrame`.
+        """
+        if name not in self._registry:
+            raise KeyError(
+                f"Column '{name}' not found. Available: {sorted(self._registry.keys())}"
+            )
+        expr = self._registry[name]
+        if isinstance(expr, Column):
+            return expr
+        return Column._wrap(expr, name)
+
+    # -----
+    # Transformation methods (each returns a *new* DataFrame)
+
+    def select(self, *cols: str | Column) -> "DataFrame[T]":
+        """Project a set of columns or expressions and return a new :class:`DataFrame`.
+
+        Parameters
+        ----------
+        *cols : str | :class:`Column`
+            Column names or column expressions to select.
+
+        Returns
+        -------
+        :class:`DataFrame`
+        """
+        new = self._clone()
+        new._select_entities = []
+        for c in cols:
+            resolved = new._resolve(c)
+            new._select_entities.append(resolved)
+            _maybe_register_label(new._registry, resolved)
+        return new
+
+    def where(self, condition: "Any") -> "DataFrame[T]":
+        """Filter rows by a boolean condition and return a new :class:`DataFrame`. If the DataFrame was grouped, this function is equivalent to using :meth:`DataFrame.having`.
+
+        Parameters
+        ----------
+        condition : :class:`Column` | "Any"
+            A boolean column expression.
+
+        Returns
+        -------
+        :class:`DataFrame`
+        """
+        if self._group_by_clauses:
+            return self.having(condition)
+
+        new = self._clone()
+        new._where_clauses.append(new._resolve(condition))
+        return new
+
+    def filter(self, condition: "Any") -> "DataFrame[T]":
+        """Filter rows by a boolean condition and return a new :class:`DataFrame`.
+
+        Alias for :meth:`DataFrame.where`.
+
+        Parameters
+        ----------
+        condition : :class:`Column` | "Any"
+            A boolean column expression.
+
+        Returns
+        -------
+        :class:`DataFrame`
+        """
+        return self.where(condition)
+
+    def groupBy(self, *cols: str | Column) -> "GroupedData[T]":
+        """Group the :class:`DataFrame` by the given columns and return a :class:`GroupedData` on which you call `agg`.
+
+        Parameters
+        ----------
+        *cols : str | :class:`Column`
+            Column names or expressions to group by.
+
+        Returns
+        -------
+        :class:`GroupedData`
+        """
+        # If already aggregated, wrap in a subquery first
+        df = self._as_subquery() if self._group_by_clauses else self
+        group_exprs = [df._resolve(c) for c in cols]
+        return GroupedData(df, group_exprs)
+
+    def group_by(self, *cols: str | Column) -> "GroupedData[T]":
+        """Group the :class:`DataFrame` by the given columns and return a :class:`GroupedData` on which you call `agg`.
+
+        Alias for :meth:`DataFrame.groupBy`.
+
+        Parameters
+        ----------
+        *cols : str | :class:`Column`
+            Column names or expressions to group by.
+
+        Returns
+        -------
+        :class:`GroupedData`
+        """
+        return self.groupBy(*cols)
+
+    def _build_agg(
+        self,
+        exprs: tuple[str | Column, ...],
+        initial_entities: "list[SQLExpr] | None" = None,
+    ) -> "DataFrame[T]":
+        new = self._clone()
+        new._select_entities = list(initial_entities) if initial_entities else []
+        for e in exprs:
+            resolved = new._resolve(e)
+            new._select_entities.append(resolved)
+            _maybe_register_label(new._registry, resolved)
+        return new
+
+    def agg(self, *exprs: str | Column) -> "DataFrame[T]":
+        """Aggregate the entire :class:`DataFrame` without grouping and return a new :class:`DataFrame`.
+
+        Parameters
+        ----------
+        *exprs : str | :class:`Column`
+            Aggregate column expressions (e.g. ``F.sum("salary").alias("total")``).
+
+        Returns
+        -------
+        :class:`DataFrame`
+        """
+        return self._build_agg(exprs)
+
+    def orderBy(self, *cols: str | Column) -> "DataFrame[T]":
+        """Sort by the given columns or expressions and return a new :class:`DataFrame`.
+
+        Parameters
+        ----------
+        *cols : str | :class:`Column`
+            Column names or expressions to sort by.
+
+        Returns
+        -------
+        :class:`DataFrame`
+        """
+        new = self._clone()
+        new._order_by_clauses = [new._resolve(c) for c in cols]
+        return new
+
+    def order_by(self, *cols: str | Column) -> "DataFrame[T]":
+        """Sort by the given columns or expressions and return a new :class:`DataFrame`.
+
+        Alias for :meth:`DataFrame.orderBy`.
+
+        Parameters
+        ----------
+        *cols : str | :class:`Column`
+            Column names or expressions to sort by.
+
+        Returns
+        -------
+        :class:`DataFrame`
+        """
+        return self.orderBy(*cols)
+
+    def having(self, condition: "Any") -> "DataFrame[T]":
+        """Add a HAVING clause to filter groups after GROUP BY and return a new :class:`DataFrame`.
+
+        Parameters
+        ----------
+        condition : :class:`Column` | Any
+            A boolean column expression applied after aggregation.
+
+        Returns
+        -------
+        :class:`DataFrame`
+        """
+        new = self._clone()
+        new._having_clauses.append(new._resolve(condition))
+        return new
+
+    def _materialise_select(self) -> list["SQLExpr"]:
+        """Populate `_select_entities` with all columns when still `None` and return the list.
+
+        Called by `withColumn` / `withColumnRenamed` which need an explicit
+        column list to modify.
+
+        Returns
+        -------
+        list[SQLExpr]
+        """
+        if self._select_entities is None:
+            mapper = sa_inspect(self._model, raiseerr=True)
+            self._select_entities = [
+                getattr(self._sa_entity, a.key) for a in mapper.column_attrs
+            ]
+            for join_entity, _, _ in self._joins:
+                jmapper = sa_inspect(join_entity)
+                for a in jmapper.column_attrs:
+                    self._select_entities.append(getattr(join_entity, a.key))
+        return self._select_entities
+
+    @staticmethod
+    def _find_and_replace_entity(
+        entities: list["SQLExpr"],
+        target_name: str,
+        replacement: "SQLExpr",
+    ) -> bool:
+        """Replace the first entity in `entities` whose name matches `target_name` and return `True` if a swap occurred.
+
+        Parameters
+        ----------
+        entities : list[SQLExpr]
+            The list of SQLAlchemy select entities to search.
+        target_name : str
+            The column name to match against.
+        replacement : SQLExpr
+            The expression to substitute in.
+
+        Returns
+        -------
+        bool
+        """
+        for i, entity in enumerate(entities):
+            ent_name = getattr(entity, "key", None) or getattr(entity, "name", None)
+            if ent_name == target_name:
+                entities[i] = replacement
+                return True
+        return False
+
+    def withColumn(self, colName: str, col: str | Column) -> "DataFrame[T]":
+        """Add or replace a column and return a new :class:`DataFrame`.
+
+        If `select` has not yet been called, this materialises all base-model
+        columns and appends the new one.  The new column is also registered by
+        `colName` so that subsequent operations can reference it as a string.
+
+        Parameters
+        ----------
+        colName : str
+            The name of the new or replaced column.
+        col : str | :class:`Column`
+            The column expression to compute.
+
+        Returns
+        -------
+        :class:`DataFrame`
+        """
+        new = self._clone()
+        labeled = new._resolve(col).label(colName)
+        new._registry[colName] = labeled
+
+        entities = new._materialise_select()
+        if not self._find_and_replace_entity(entities, colName, labeled):
+            entities.append(labeled)
+
+        return new
+
+    def withColumnRenamed(self, existing: str, new: str) -> "DataFrame[T]":
+        """Rename a column and return a new :class:`DataFrame`. The old name is removed from the registry and the new name is registered.
+
+        Parameters
+        ----------
+        existing : str
+            The current name of the column.
+        new : str
+            The new name for the column.
+
+        Returns
+        -------
+        :class:`DataFrame`
+
+        Raises
+        ------
+        KeyError
+            `existing` is not a column in this :class:`DataFrame`.
+        """
+        if existing not in self._registry:
+            raise KeyError(
+                f"Column '{existing}' not found. "
+                f"Available: {sorted(self._registry.keys())}"
+            )
+        new_df = self._clone()
+        old_expr = new_df._registry.pop(existing)
+        if isinstance(old_expr, Column):
+            old_expr = old_expr.resolve(new_df._registry)
+        labeled = old_expr.label(new)
+        new_df._registry[new] = labeled
+
+        entities = new_df._materialise_select()
+        self._find_and_replace_entity(entities, existing, labeled)
+
+        return new_df
+
+    def join(
+        self,
+        other: "DataFrame[Any]",
+        on: Column | str | list[str] | None = None,
+        how: str = "inner",
+    ) -> "DataFrame[T]":
+        """Join with another :class:`DataFrame` and return a new :class:`DataFrame`.
+
+        Parameters
+        ----------
+        other : :class:`DataFrame`
+            The right-hand :class:`DataFrame`.
+        on : :class:`Column` | str | list[str] | None, optional
+            Join condition.  Accepts a :class:`Column` expression (including inequality joins), a single column-name string present in both DataFrames (equi-join), a list of column-name strings (multi-column equi-join), or `None` for a cross join. Defaults to `None`.
+        how : str, optional
+            Join type: `"inner"`, `"left"` / `"left_outer"`, `"right"` / `"right_outer"`, `"full"` / `"outer"` / `"full_outer"`, or `"cross"`. Defaults to `"inner"`.
+
+        Returns
+        -------
+        :class:`DataFrame`
+        """
+        new = self._clone()
+
+        # Auto-alias the right side for self-joins (same underlying model)
+        # to prevent ambiguous column references.
+        if other._model is self._model and other._alias_name is None:
+            # Pick a name that won't collide with an existing alias
+            auto_name = f"_{other._model.__name__.lower()}_2"
+            other = other.alias(auto_name)
+
+        # Build a combined registry for resolving the ON clause.
+        # Dot-prefixed entries (from aliases) are included automatically.
+        combined_registry = {**new._registry, **other._registry}
+
+        # Resolve the join condition
+        if isinstance(on, str):
+            # Single column name equi-join.  Look up the bare name in each
+            # side's own registry (so aliased names don't collide).
+            left_expr = self._resolve(on)
+            right_expr = other._resolve(on)
+            join_cond = left_expr == right_expr
+        elif isinstance(on, (list, tuple)):
+            parts = [self._resolve(c) == other._resolve(c) for c in on]
+            join_cond = and_(*parts)
+        elif isinstance(on, Column):
+            join_cond = on.resolve(combined_registry)
+        else:
+            join_cond = on  # raw SA expression or None (cross join)
+
+        new._joins.append((other._sa_entity, join_cond, how.lower()))
+
+        # Merge the other DataFrame's registry into ours.
+        # Strategy:
+        #   1. Dot-prefixed names (e.g. "b.salary") always come through.
+        #   2. Bare names come through if there's no conflict.
+        #   3. On conflict, if the other side has an alias the bare name is
+        #      skipped (user should use "alias.col"); otherwise we auto-prefix
+        #      with the model name as a fallback.
+        for name, expr in other._registry.items():
+            if name not in new._registry:
+                new._registry[name] = expr
+            elif "." in name:
+                # Dot-prefixed from an alias — always keep (overwrite is fine;
+                # each alias is unique)
+                new._registry[name] = expr
+            elif other._alias_name:
+                # Bare-name conflict and other side is aliased: user can use
+                # "alias.col", so skip the bare name to avoid ambiguity.
+                pass
+            else:
+                # Bare-name conflict, no alias: auto-prefix with model name
+                prefixed = f"{other._model.__name__.lower()}_{name}"
+                new._registry[prefixed] = expr
+
+        return new
+
+    def distinct(self) -> "DataFrame[T]":
+        """Return a new :class:`DataFrame` with duplicate rows removed.
+
+        Returns
+        -------
+        :class:`DataFrame`
+        """
+        new = self._clone()
+        new._is_distinct = True
+        return new
+
+    def limit(self, n: int) -> "DataFrame[T]":
+        """Limit the result to `n` rows and return a new :class:`DataFrame`.
+
+        Parameters
+        ----------
+        n : int
+            Maximum number of rows to return.
+
+        Returns
+        -------
+        :class:`DataFrame`
+        """
+        new = self._clone()
+        new._limit_val = n
+        return new
+
+    def offset(self, n: int) -> "DataFrame[T]":
+        """Skip the first `n` rows and return a new :class:`DataFrame`.
+
+        Parameters
+        ----------
+        n : int
+            Number of rows to skip.
+
+        Returns
+        -------
+        :class:`DataFrame`
+        """
+        new = self._clone()
+        new._offset_val = n
+        return new
+
+    def union(self, other: "DataFrame[Any]") -> "DataFrame[T]":
+        """Combine two DataFrames with `UNION ALL` and return a new :class:`DataFrame`. Both DataFrames must produce the same columns.
+
+        Parameters
+        ----------
+        other : :class:`DataFrame`
+            The other :class:`DataFrame` to union with.
+
+        Returns
+        -------
+        :class:`DataFrame`
+        """
+        new = self._clone()
+        new._union_other = other
+        return new
+
+    # -----
+    # Query building
+
+    def _build_query(self) -> "Select[Any] | CompoundSelect[Any]":
+        """Compile the accumulated transformations into a :class:`~sqlalchemy.sql.Select`."""
+        # Determine SELECT entities
+        if self._select_entities is not None:
+            entities = list(self._select_entities)
+        else:
+            entities = [self._sa_entity]
+
+        stmt = sa_select(*entities).select_from(self._sa_entity)
+
+        # JOINs — each tuple stores (entity, on-clause, how)
+        for join_entity, join_cond, how in self._joins:
+            if how == "inner":
+                stmt = stmt.join(join_entity, join_cond)
+            elif how in ("left", "left_outer"):
+                stmt = stmt.outerjoin(join_entity, join_cond)
+            elif how in ("right", "right_outer"):
+                stmt = stmt.join_from(
+                    join_entity,
+                    self._sa_entity,
+                    join_cond,
+                    isouter=True,
+                )
+            elif how in ("full", "full_outer", "outer"):
+                stmt = stmt.outerjoin(join_entity, join_cond, full=True)
+            elif how == "cross":
+                stmt = stmt.join(join_entity, literal(True))
+
+        # WHERE
+        for clause in self._where_clauses:
+            stmt = stmt.where(clause)
+
+        # GROUP BY
+        if self._group_by_clauses:
+            stmt = stmt.group_by(*self._group_by_clauses)
+
+        # HAVING
+        for clause in self._having_clauses:
+            stmt = stmt.having(clause)
+
+        # ORDER BY
+        if self._order_by_clauses:
+            stmt = stmt.order_by(*self._order_by_clauses)
+
+        # DISTINCT
+        if self._is_distinct:
+            stmt = stmt.distinct()
+
+        # LIMIT / OFFSET
+        if self._limit_val is not None:
+            stmt = stmt.limit(self._limit_val)
+        if self._offset_val is not None:
+            stmt = stmt.offset(self._offset_val)
+
+        # UNION
+        if self._union_other is not None:
+            other_stmt = self._union_other._build_query()
+            stmt = union_all(stmt, other_stmt)
+
+        return stmt
+
+    # -----
+    # Display methods
+
+    def collect(self) -> list[Row]:
+        """Execute the query and return a list of :class:`Row` objects.
+
+        Returns
+        -------
+        list[:class:`Row`]
+        """
+        stmt = self._build_query()
+        result = self._session.execute(stmt)
+
+        rows: list[Row] = []
+        for sa_row in result:
+            # SA 2.0 Row objects expose `._mapping`
+            if hasattr(sa_row, "_mapping"):
+                mapping = dict(sa_row._mapping)
+                # When selecting the whole model (`select(Model)`), the
+                # mapping looks like `{"ModelName": <instance>}`.  Unpack
+                # the ORM instance into its column attributes.
+                if len(mapping) == 1:
+                    single_val = next(iter(mapping.values()))
+                    if hasattr(single_val, "__table__"):
+                        mapper = sa_inspect(single_val.__class__)
+                        mapping = {
+                            a.key: getattr(single_val, a.key)
+                            for a in mapper.column_attrs
+                        }
+                rows.append(Row(mapping))
+            # Fallback for unexpected result shapes
+            elif isinstance(sa_row, tuple):
+                rows.append(Row({f"_{i}": v for i, v in enumerate(sa_row)}))
+            else:
+                rows.append(Row({"_0": sa_row}))
+        return rows
+
+    def show(self, n: int = 20, truncate: int = 30):
+        """Print the first `n` rows in a PySpark-style table.
+
+        Parameters
+        ----------
+        n : int, optional
+            Maximum number of rows to display. Defaults to 20.
+        truncate : int, optional
+            Maximum width for each column before truncating with `…`. Defaults to 30.
+        """
+        rows = self.limit(n).collect()
+        if not rows:
+            print("(empty DataFrame)")
+            return
+
+        keys = rows[0]._keys
+        # Compute column widths
+        str_rows = []
+        for row in rows:
+            str_rows.append([_trunc(str(row[k]), truncate) for k in keys])
+
+        widths = [len(k) for k in keys]
+        for sr in str_rows:
+            for i, val in enumerate(sr):
+                widths[i] = max(widths[i], len(val))
+
+        def _fmt_row(values: list) -> str:
+            cells = [v.ljust(widths[i]) for i, v in enumerate(values)]
+            return "| " + " | ".join(cells) + " |"
+
+        sep = "+" + "+".join("-" * (w + 2) for w in widths) + "+"
+        print(sep)
+        print(_fmt_row(list(keys)))
+        print(sep)
+        for sr in str_rows:
+            print(_fmt_row(sr))
+        print(sep)
+        if len(rows) == n:
+            print(f"(showing first {n} rows)")
+
+    def toPandas(self):
+        """Execute the query and return a :class:`~pandas.DataFrame`.
+
+        Returns
+        -------
+        :class:`~pandas.DataFrame`
+        """
+        import pandas as pd
+
+        rows = self.collect()
+        if not rows:
+            return pd.DataFrame()
+        return pd.DataFrame([r.asDict() for r in rows])
+
+    def to_pandas(self):
+        """Execute the query and return a :class:`~pandas.DataFrame`.
+
+        Alias for :meth:`DataFrame.toPandas`.
+
+        Returns
+        -------
+        :class:`~pandas.DataFrame`
+        """
+        return self.toPandas()
+
+    def count(self) -> int:
+        """Return the number of rows.
+
+        Returns
+        -------
+        int
+        """
+        stmt = sa_select(sa_func.count()).select_from(self._build_query().subquery())
+        return self._session.execute(stmt).scalar_one()
+
+    def first(self) -> Row | None:
+        """Return the first row, or `None` if the :class:`DataFrame` is empty.
+
+        Returns
+        -------
+        :class:`Row` | None
+        """
+        rows = self.limit(1).collect()
+        return rows[0] if rows else None
+
+    def take(self, n: int) -> list[Row]:
+        """Return the first `n` rows as a list.
+
+        Parameters
+        ----------
+        n : int
+            The number of rows to return.
+
+        Returns
+        -------
+        list[:class:`Row`]
+        """
+        return self.limit(n).collect()
+
+    # -----
+    # Mutation methods
+
+    def delete(self, condition: "Any | None" = None) -> int:
+        """Delete rows from the underlying table and return the number of rows deleted.
+
+        Uses the accumulated `where` clauses (and an optional inline
+        `condition`) to build a `DELETE` statement.  The deletion is flushed
+        to the database but **not** committed — call
+        :meth:`~sqlalchemy.orm.Session.commit` on the session when ready.
+
+        Calling `delete` without "Any" filters will raise a :class:`RuntimeError`
+        as a safety measure.  Pass `condition=lit(True)` to explicitly delete
+        every row.
+
+        Parameters
+        ----------
+        condition : :class:`Column` | "Any" | None, optional
+            An additional boolean filter applied on top of "Any" existing
+            `where` clauses.  Defaults to `None`.
+
+        Returns
+        -------
+        int
+
+        Raises
+        ------
+        RuntimeError
+            No filter was provided (neither via `where` nor `condition`),
+            which would delete every row in the table.
+        """
+        df = self.where(condition) if condition is not None else self
+
+        if not df._where_clauses:
+            raise RuntimeError(
+                "Refusing to delete without a filter. "
+                "If you really want to delete every row, use .delete(lit(True))."
+            )
+
+        table, adapter = df._table_and_adapter()
+
+        stmt = sa_delete(table)
+        for clause in df._where_clauses:
+            stmt = stmt.where(adapter.traverse(clause) if adapter else clause)  # type: ignore
+
+        result = cast(CursorResult, self._session.execute(stmt))
+        self._session.flush()
+        return result.rowcount
+
+    def update(
+        self,
+        set_: dict[str, "Any"],
+        where: "Any | None" = None,
+    ) -> int:
+        """Update rows in the underlying table and return the number of rows updated.
+
+        Uses the accumulated `where` clauses (and an optional inline `where`
+        parameter) to build an `UPDATE ... SET ...` statement.  The update is
+        flushed to the database but **not** committed — call
+        :meth:`~sqlalchemy.orm.Session.commit` on the session when ready.
+
+        Calling `update` without "Any" filters will raise a :class:`RuntimeError`
+        as a safety measure.  Pass `where=lit(True)` to explicitly update
+        every row.
+
+        Parameters
+        ----------
+        set_ : dict[str, :class:`Column` | "Any"]
+            A mapping of column names to new values.  Values can be
+            :class:`Column` expressions (which reference other columns)
+            or plain Python values.
+        where : :class:`Column` | "Any" | None, optional
+            An additional boolean filter applied on top of "Any" existing
+            `where` clauses.  Defaults to `None`.
+
+        Returns
+        -------
+        int
+
+        Raises
+        ------
+        RuntimeError
+            No filter was provided (neither via chained `where` calls nor the
+            `where` parameter), which would update every row in the table.
+        """
+        df = self.where(where) if where is not None else self
+
+        if not df._where_clauses:
+            raise RuntimeError(
+                "Refusing to update without a filter. "
+                "If you really want to update every row, pass where=lit(True)."
+            )
+
+        table, adapter = df._table_and_adapter()
+
+        # Resolve set_ values — Col expressions need resolving against the
+        # registry, and the results may need alias adaptation.  Bare strings
+        # are treated as literal values, not column references.
+        resolved_values: dict[str, "Any"] = {}
+        for col_name, value in set_.items():
+            if isinstance(value, Column):
+                resolved = df._resolve(value)
+                if adapter is not None:
+                    resolved = adapter.traverse(resolved)  # type: ignore
+                resolved_values[col_name] = resolved
+            else:
+                resolved_values[col_name] = value
+
+        stmt = sa_update(table).values(resolved_values)
+        for clause in df._where_clauses:
+            stmt = stmt.where(adapter.traverse(clause) if adapter else clause)  # type: ignore
+
+        result = cast(CursorResult, self._session.execute(stmt))
+        self._session.flush()
+        return result.rowcount
+
+    def _table_and_adapter(self) -> tuple["Table", ClauseAdapter | None]:
+        """Return the raw table and, if this :class:`DataFrame` is aliased, a :class:`~sqlalchemy.sql.util.ClauseAdapter` that rewrites alias references back to the raw table.
+
+        Returns
+        -------
+        tuple[:class:`~sqlalchemy.sql.Table`, :class:`~sqlalchemy.sql.util.ClauseAdapter` | None]
+        """
+        mapper = sa_inspect(self._model, raiseerr=True)
+        table = mapper.local_table
+
+        if self._alias_name is None:
+            return table, None
+
+        aliased_selectable = sa_inspect(self._sa_entity).selectable
+        adapter = ClauseAdapter(
+            table,
+            equivalents={
+                c: {table.c[c.key]} for c in aliased_selectable.c if c.key in table.c
+            },
+        )
+        return table, adapter
+
+    def explain(self, dialect: str | None = None) -> str:
+        """Return the compiled SQL string for debugging.
+
+        Parameters
+        ----------
+        dialect : str | None, optional
+            If `None`, uses a generic compilation.  Pass `"mysql"`, `"sqlite"`, `"postgresql"`, etc. to see dialect-specific SQL. Defaults to `None`.
+
+        Returns
+        -------
+        str
+        """
+        stmt = self._build_query()
+        compile_kwargs = {"literal_binds": True}
+        if dialect:
+            from sqlalchemy.dialects import registry as dialect_registry
+
+            dialect_cls = dialect_registry.load(dialect)
+            compiled = stmt.compile(
+                dialect=dialect_cls(), compile_kwargs=compile_kwargs
+            )
+        else:
+            compiled = stmt.compile(compile_kwargs=compile_kwargs)
+        return str(compiled)
+
+    def printSchema(self):
+        """Print the available columns and their types in a PySpark-style schema tree.
+
+        The output lists each mapped column with its SQLAlchemy type and
+        nullability, mirroring the format of PySpark's ``DataFrame.printSchema()``.
+        """
+        print(f"root (model: {self._model.__name__})")
+        mapper = sa_inspect(self._model, raiseerr=True)
+        for attr in mapper.column_attrs:
+            for mapped_col in attr.columns:
+                nullable = "nullable" if mapped_col.nullable else "not null"
+                print(f" |-- {attr.key}: {mapped_col.type} ({nullable})")
+
+    @property
+    def columns(self) -> list[str]:
+        """Return a sorted list of available column names.
+
+        Returns
+        -------
+        list[str]
+        """
+        return sorted(self._registry.keys())
+
+    def __repr__(self) -> str:
+        alias_part = f" as '{self._alias_name}'" if self._alias_name else ""
+        cols = ", ".join(self.columns[:8])
+        suffix = ", …" if len(self.columns) > 8 else ""
+        return f"DataFrame[{self._model.__name__}{alias_part}]({cols}{suffix})"
+
+
+def _maybe_register_label(registry: dict[str, "Any"], resolved: "SQLExpr"):
+    """If `resolved` is a labelled expression, add it to `registry` under its label name."""
+    if isinstance(resolved, Label):
+        registry[resolved.name] = resolved
+
+
+def _trunc(s: str, width: int) -> str:
+    return s if len(s) <= width else s[: width - 1] + "…"
+
+
+def table(session: Session, model: type[T]) -> DataFrame[T]:
+    """Create a :class:`DataFrame` from an ORM model. Convenience alias for the constructor.
+
+    Parameters
+    ----------
+    session : :class:`~sqlalchemy.orm.Session`
+        An active SQLAlchemy ORM session.
+    model : type
+        A SQLAlchemy ORM mapped class.
+
+    Returns
+    -------
+    :class:`DataFrame`
+    """
+    return DataFrame(session, model)

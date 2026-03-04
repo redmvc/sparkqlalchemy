@@ -118,8 +118,7 @@ class Column:
         return self._binop(other, lambda left, right: or_(left, right), "|")
 
     def __invert__(self) -> "Column":
-        parent = self._resolver
-        return Column(lambda reg: not_(parent(reg)), f"~{self._name}")
+        return Column(lambda reg: not_(self._resolver(reg)), f"~{self._name}")
 
     def __add__(self, other: "Any") -> "Column":
         return self._binop(other, lambda left, right: left + right, "+")
@@ -192,8 +191,7 @@ class Column:
         -------
         :class:`Column`
         """
-        parent = self._resolver
-        return Column(lambda reg: parent(reg).label(name), name)
+        return Column(lambda reg: self._resolver(reg).label(name), name)
 
     def asc(self) -> "Column":
         """Return a new :class:`Column` that sorts this expression in ascending order.
@@ -202,8 +200,7 @@ class Column:
         -------
         :class:`Column`
         """
-        parent = self._resolver
-        return Column(lambda reg: parent(reg).asc(), self._name)
+        return Column(lambda reg: self._resolver(reg).asc(), self._name)
 
     def desc(self) -> "Column":
         """Return a new :class:`Column` that sorts this expression in descending order.
@@ -212,8 +209,7 @@ class Column:
         -------
         :class:`Column`
         """
-        parent = self._resolver
-        return Column(lambda reg: parent(reg).desc(), self._name)
+        return Column(lambda reg: self._resolver(reg).desc(), self._name)
 
     def like(self, pattern: str) -> "Column":
         """Return a new :class:`Column` that applies a SQL ``LIKE`` filter.
@@ -227,8 +223,7 @@ class Column:
         -------
         :class:`Column`
         """
-        parent = self._resolver
-        return Column(lambda reg: parent(reg).like(pattern), self._name)
+        return Column(lambda reg: self._resolver(reg).like(pattern), self._name)
 
     def ilike(self, pattern: str) -> "Column":
         """Return a new :class:`Column` that applies a case-insensitive SQL ``LIKE`` filter.
@@ -242,8 +237,7 @@ class Column:
         -------
         :class:`Column`
         """
-        parent = self._resolver
-        return Column(lambda reg: parent(reg).ilike(pattern), self._name)
+        return Column(lambda reg: self._resolver(reg).ilike(pattern), self._name)
 
     def rlike(self, pattern: str) -> "Column":
         """Return a new :class:`Column` that tests this expression against a regular expression.
@@ -257,8 +251,7 @@ class Column:
         -------
         :class:`Column`
         """
-        parent = self._resolver
-        return Column(lambda reg: parent(reg).regexp_match(pattern), self._name)
+        return Column(lambda reg: self._resolver(reg).regexp_match(pattern), self._name)
 
     def isin(self, *values: "Any") -> "Column":
         """Return a new :class:`Column` that tests whether this expression is in a set of values.
@@ -274,13 +267,12 @@ class Column:
         -------
         :class:`Column`
         """
-        parent = self._resolver
         flat = (
             values[0]
             if len(values) == 1 and isinstance(values[0], (list, tuple, set))
             else values
         )
-        return Column(lambda reg: parent(reg).in_(flat), self._name)
+        return Column(lambda reg: self._resolver(reg).in_(flat), self._name)
 
     def isNull(self) -> "Column":
         """Return a new :class:`Column` that tests whether this expression is ``NULL``.
@@ -289,8 +281,7 @@ class Column:
         -------
         :class:`Column`
         """
-        parent = self._resolver
-        return Column(lambda reg: parent(reg).is_(None), self._name)
+        return Column(lambda reg: self._resolver(reg).is_(None), self._name)
 
     def isNotNull(self) -> "Column":
         """Return a new :class:`Column` that tests whether this expression is not ``NULL``.
@@ -299,8 +290,7 @@ class Column:
         -------
         :class:`Column`
         """
-        parent = self._resolver
-        return Column(lambda reg: parent(reg).isnot(None), self._name)
+        return Column(lambda reg: self._resolver(reg).isnot(None), self._name)
 
     def between(self, lower: "Any", upper: "Any") -> "Column":
         """Return a new :class:`Column` that tests whether this expression falls within an inclusive range.
@@ -316,10 +306,11 @@ class Column:
         -------
         :class:`Column`
         """
-        parent = self._resolver
         lo = lower._resolver if isinstance(lower, Column) else lambda _: lower
         hi = upper._resolver if isinstance(upper, Column) else lambda _: upper
-        return Column(lambda reg: parent(reg).between(lo(reg), hi(reg)), self._name)
+        return Column(
+            lambda reg: self._resolver(reg).between(lo(reg), hi(reg)), self._name
+        )
 
     def cast(self, type_: "Any") -> "Column":
         """Cast this expression to a different SQL type and return a new :class:`Column`.
@@ -333,8 +324,7 @@ class Column:
         -------
         :class:`Column`
         """
-        parent = self._resolver
-        return Column(lambda reg: cast(parent(reg), type_), self._name)
+        return Column(lambda reg: cast(self._resolver(reg), type_), self._name)
 
     def startswith(self, prefix: str) -> "Column":
         """Return a new :class:`Column` that tests whether this expression starts with `prefix`.
@@ -348,8 +338,7 @@ class Column:
         -------
         :class:`Column`
         """
-        parent = self._resolver
-        return Column(lambda reg: parent(reg).startswith(prefix), self._name)
+        return Column(lambda reg: self._resolver(reg).startswith(prefix), self._name)
 
     def endswith(self, suffix: str) -> "Column":
         """Return a new :class:`Column` that tests whether this expression ends with `suffix`.
@@ -363,8 +352,7 @@ class Column:
         -------
         :class:`Column`
         """
-        parent = self._resolver
-        return Column(lambda reg: parent(reg).endswith(suffix), self._name)
+        return Column(lambda reg: self._resolver(reg).endswith(suffix), self._name)
 
     def contains(self, substr: str) -> "Column":
         """Return a new :class:`Column` that tests whether this expression contains `substr`.
@@ -378,8 +366,7 @@ class Column:
         -------
         :class:`Column`
         """
-        parent = self._resolver
-        return Column(lambda reg: parent(reg).contains(substr), self._name)
+        return Column(lambda reg: self._resolver(reg).contains(substr), self._name)
 
     # -----
     # Display / safety

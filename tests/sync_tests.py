@@ -6,7 +6,7 @@ translates correctly to SQLAlchemy and returns the expected results.
 
 Run with::
 
-    pytest tests/sparkqlalchemy_tests.py -v
+    pytest tests/syntc_tests.py -v
 """
 
 from __future__ import annotations

@@ -1,4 +1,4 @@
-__version__ = "0.3"
+__version__ = "0.3.1"
 
 from . import functions
 from .column import Column, WhenExpr

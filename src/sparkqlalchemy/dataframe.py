@@ -1,5 +1,6 @@
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Self, cast, overload
+from enum import Enum
+from typing import TYPE_CHECKING, Literal, Self, TypeVar, cast, overload
 
 from sqlalchemy import CursorResult, and_, literal, union_all
 from sqlalchemy import delete as sa_delete
@@ -11,6 +12,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import Session, aliased
 from sqlalchemy.sql.elements import Label
 from sqlalchemy.sql.util import ClauseAdapter
+from typing_extensions import Sentinel
 
 from . import functions as F
 from .column import Column
@@ -21,6 +23,17 @@ if TYPE_CHECKING:
     from sqlalchemy import CompoundSelect, Select, Table
 
     from .column import SQLExpr
+
+
+class Missing(Enum):
+    MISSING = Sentinel("MISSING", "MISSING")
+
+    def __repr__(self) -> str:
+        return "MISSING"
+
+
+MissingType = Literal[Missing.MISSING]
+MISSING = Missing.MISSING
 
 
 @dataclass(frozen=True)
@@ -206,8 +219,6 @@ class _DataFrameBase[T]:
         self._is_distinct: bool = False
         self._limit_val: int | None = None
         self._offset_val: int | None = None
-        self._union_other: "_DataFrameBase | None" = None
-
         # Build initial column registry from the ORM model
         self._init_registry(model)
 
@@ -216,47 +227,292 @@ class _DataFrameBase[T]:
         for attr in mapper.column_attrs:
             self._registry[attr.key] = getattr(self._sa_entity, attr.key)
 
-    def _clone(self) -> Self:
-        new: _DataFrameBase[T] = object.__new__(type(self))
-        new._session = self._session
-        new._model = self._model
-        new._sa_entity = self._sa_entity
-        new._registry = self._registry.copy()
-        new._alias_name = self._alias_name
+    @overload
+    @classmethod
+    def _factory(
+        cls,
+        *,
+        df: "DataFrame[T]",
+        target_type: "MissingType" = MISSING,
+        session: Session | AsyncSession | MissingType = MISSING,
+        model: type[T] | MissingType = MISSING,
+        sa_entity: "Any | MissingType" = MISSING,
+        registry: dict[str, "SQLExpr | Column"] | MissingType = MISSING,
+        alias_name: str | None | MissingType = MISSING,
+        select_entities: list["SQLExpr"] | None | MissingType = MISSING,
+        where_clauses: list["SQLExpr"] | MissingType = MISSING,
+        group_by_clauses: list["SQLExpr"] | MissingType = MISSING,
+        having_clauses: list["SQLExpr"] | MissingType = MISSING,
+        order_by_clauses: list["SQLExpr"] | MissingType = MISSING,
+        joins: list[tuple["Any", "SQLExpr | None", str]] | MissingType = MISSING,
+        is_distinct: bool | MissingType = MISSING,
+        limit_val: int | None | MissingType = MISSING,
+        offset_val: int | None | MissingType = MISSING,
+    ) -> "DataFrame[T]":
+        pass
+
+    @overload
+    @classmethod
+    def _factory(
+        cls,
+        *,
+        df: "AsyncDataFrame[T]",
+        target_type: "MissingType" = MISSING,
+        session: Session | AsyncSession | MissingType = MISSING,
+        model: type[T] | MissingType = MISSING,
+        sa_entity: "Any | MissingType" = MISSING,
+        registry: dict[str, "SQLExpr | Column"] | MissingType = MISSING,
+        alias_name: str | None | MissingType = MISSING,
+        select_entities: list["SQLExpr"] | None | MissingType = MISSING,
+        where_clauses: list["SQLExpr"] | MissingType = MISSING,
+        group_by_clauses: list["SQLExpr"] | MissingType = MISSING,
+        having_clauses: list["SQLExpr"] | MissingType = MISSING,
+        order_by_clauses: list["SQLExpr"] | MissingType = MISSING,
+        joins: list[tuple["Any", "SQLExpr | None", str]] | MissingType = MISSING,
+        is_distinct: bool | MissingType = MISSING,
+        limit_val: int | None | MissingType = MISSING,
+        offset_val: int | None | MissingType = MISSING,
+    ) -> "AsyncDataFrame[T]":
+        pass
+
+    @overload
+    @classmethod
+    def _factory(
+        cls,
+        *,
+        df: "_DataFrameBase[T]",
+        target_type: "type[DFT]",
+        session: Session | AsyncSession | MissingType = MISSING,
+        model: type[T] | MissingType = MISSING,
+        sa_entity: "Any | MissingType" = MISSING,
+        registry: dict[str, "SQLExpr | Column"] | MissingType = MISSING,
+        alias_name: str | None | MissingType = MISSING,
+        select_entities: list["SQLExpr"] | None | MissingType = MISSING,
+        where_clauses: list["SQLExpr"] | MissingType = MISSING,
+        group_by_clauses: list["SQLExpr"] | MissingType = MISSING,
+        having_clauses: list["SQLExpr"] | MissingType = MISSING,
+        order_by_clauses: list["SQLExpr"] | MissingType = MISSING,
+        joins: list[tuple["Any", "SQLExpr | None", str]] | MissingType = MISSING,
+        is_distinct: bool | MissingType = MISSING,
+        limit_val: int | None | MissingType = MISSING,
+        offset_val: int | None | MissingType = MISSING,
+    ) -> "DFT":
+        pass
+
+    @overload
+    @classmethod
+    def _factory(
+        cls,
+        *,
+        df: "MissingType" = MISSING,
+        target_type: "type[DFT]",
+        session: Session | AsyncSession,
+        model: type[T],
+        sa_entity: "Any | MissingType" = MISSING,
+        registry: dict[str, "SQLExpr | Column"] | MissingType = MISSING,
+        alias_name: str | None | MissingType = MISSING,
+        select_entities: list["SQLExpr"] | None | MissingType = MISSING,
+        where_clauses: list["SQLExpr"] | MissingType = MISSING,
+        group_by_clauses: list["SQLExpr"] | MissingType = MISSING,
+        having_clauses: list["SQLExpr"] | MissingType = MISSING,
+        order_by_clauses: list["SQLExpr"] | MissingType = MISSING,
+        joins: list[tuple["Any", "SQLExpr | None", str]] | MissingType = MISSING,
+        is_distinct: bool | MissingType = MISSING,
+        limit_val: int | None | MissingType = MISSING,
+        offset_val: int | None | MissingType = MISSING,
+    ) -> "DFT":
+        pass
+
+    @overload
+    @classmethod
+    def _factory(
+        cls,
+        *,
+        df: "_DataFrameBase[T] | MissingType" = MISSING,
+        target_type: "type | MissingType" = MISSING,
+        session: Session | AsyncSession | MissingType = MISSING,
+        model: type[T] | MissingType = MISSING,
+        sa_entity: "Any | MissingType" = MISSING,
+        registry: dict[str, "SQLExpr | Column"] | MissingType = MISSING,
+        alias_name: str | None | MissingType = MISSING,
+        select_entities: list["SQLExpr"] | None | MissingType = MISSING,
+        where_clauses: list["SQLExpr"] | MissingType = MISSING,
+        group_by_clauses: list["SQLExpr"] | MissingType = MISSING,
+        having_clauses: list["SQLExpr"] | MissingType = MISSING,
+        order_by_clauses: list["SQLExpr"] | MissingType = MISSING,
+        joins: list[tuple["Any", "SQLExpr | None", str]] | MissingType = MISSING,
+        is_distinct: bool | MissingType = MISSING,
+        limit_val: int | None | MissingType = MISSING,
+        offset_val: int | None | MissingType = MISSING,
+    ) -> "_DataFrameBase[T]":
+        pass
+
+    @classmethod
+    def _factory(
+        cls,
+        *,
+        df: "_DataFrameBase[T] | MissingType" = MISSING,
+        target_type: "type | MissingType" = MISSING,
+        session: Session | AsyncSession | MissingType = MISSING,
+        model: type[T] | MissingType = MISSING,
+        sa_entity: "Any | MissingType" = MISSING,
+        registry: dict[str, "SQLExpr | Column"] | MissingType = MISSING,
+        alias_name: str | None | MissingType = MISSING,
+        select_entities: list["SQLExpr"] | None | MissingType = MISSING,
+        where_clauses: list["SQLExpr"] | MissingType = MISSING,
+        group_by_clauses: list["SQLExpr"] | MissingType = MISSING,
+        having_clauses: list["SQLExpr"] | MissingType = MISSING,
+        order_by_clauses: list["SQLExpr"] | MissingType = MISSING,
+        joins: list[tuple["Any", "SQLExpr | None", str]] | MissingType = MISSING,
+        is_distinct: bool | MissingType = MISSING,
+        limit_val: int | None | MissingType = MISSING,
+        offset_val: int | None | MissingType = MISSING,
+    ) -> "_DataFrameBase[T]":
+        """Creates a new DataFrame from the parameters that are present. If `df` is present, all missing parameters will default to the values in `df`; otherwise, `target_type`, `session`, and `model` must all be present, and all other parameters will default to the same defaults a fresh instance would have (mostly empty values).
+
+        Parameters
+        ----------
+        df : _DataFrameBase[T], optional
+            A DataFrame to template the new one off of. If `df` is present, all missing parameters will be copied from it. Otherwise, all of `target_type`, `session`, and `model` must be present.
+        target_type : type, optional
+            If present, must be either `DataFrame` or `AsyncDataFrame`, to create the correct type of object.
+        session : Session | AsyncSession, optional
+            If present, must be the correct type of session for the DataFrame type.
+        model : type[T], optional
+            The database table model.
+        sa_entity : Any, optional
+        registry : dict[str, "SQLExpr | Column"], optional
+        alias_name : str | None, optional
+        select_entities : list["SQLExpr"] | None, optional
+        where_clauses : list["SQLExpr"], optional
+        group_by_clauses : list["SQLExpr"], optional
+        having_clauses : list["SQLExpr"], optional
+        order_by_clauses : list["SQLExpr"], optional
+        joins : list[tuple["Any", "SQLExpr | None", str]], optional
+        is_distinct : bool | None, optional
+        limit_val : int | None, optional
+        offset_val : int | None, optional
+
+        Returns
+        -------
+        _DataFrameBase[T]
+
+        Raises
+        ------
+        AttributeError
+            If `df` is not present and either `target_type`, `session`, or `model` is not present.
+        ValueError
+            If `session` is present and not the correct type of session for the DataFrame type.
+        """
+        if df is not MISSING:
+            target_type = target_type if target_type is not MISSING else type(df)
+            session = session if session is not MISSING else df._session
+            model = model if model is not MISSING else df._model
+            sa_entity = sa_entity if sa_entity is not MISSING else df._sa_entity
+            registry = registry if registry is not MISSING else df._registry
+            alias_name = alias_name if alias_name is not MISSING else df._alias_name
+            select_entities = (
+                select_entities
+                if select_entities is not MISSING
+                else df._select_entities
+            )
+            where_clauses = (
+                where_clauses if where_clauses is not MISSING else df._where_clauses
+            )
+            group_by_clauses = (
+                group_by_clauses
+                if group_by_clauses is not MISSING
+                else df._group_by_clauses
+            )
+            having_clauses = (
+                having_clauses if having_clauses is not MISSING else df._having_clauses
+            )
+            order_by_clauses = (
+                order_by_clauses
+                if order_by_clauses is not MISSING
+                else df._order_by_clauses
+            )
+            joins = joins if joins is not MISSING else df._joins
+            is_distinct = is_distinct if is_distinct is not MISSING else df._is_distinct
+            limit_val = limit_val if limit_val is not MISSING else df._limit_val
+            offset_val = offset_val if offset_val is not MISSING else df._offset_val
+        elif target_type is MISSING:
+            raise AttributeError("Either `df` or `target_type` must be present.")
+        elif session is MISSING:
+            raise AttributeError("Either `df` or `session` must be present.")
+        elif model is MISSING:
+            raise AttributeError("Either `df` or `model` must be present.")
+        else:
+            sa_entity = sa_entity if sa_entity is not MISSING else model
+            registry = registry if registry is not MISSING else {}
+            alias_name = alias_name if alias_name is not MISSING else None
+            select_entities = (
+                select_entities if select_entities is not MISSING else None
+            )
+            where_clauses = where_clauses if where_clauses is not MISSING else []
+            group_by_clauses = (
+                group_by_clauses if group_by_clauses is not MISSING else []
+            )
+            having_clauses = having_clauses if having_clauses is not MISSING else []
+            order_by_clauses = (
+                order_by_clauses if order_by_clauses is not MISSING else []
+            )
+            joins = joins if joins is not MISSING else []
+            is_distinct = is_distinct if is_distinct is not MISSING else False
+            limit_val = limit_val if limit_val is not MISSING else None
+            offset_val = offset_val if offset_val is not MISSING else None
+
+        if (isinstance(session, Session) and (target_type is AsyncDataFrame)) or (
+            isinstance(session, AsyncSession) and (target_type is DataFrame)
+        ):
+            raise ValueError("Invalid session type for the target DataFrame type.")
+
+        new: _DataFrameBase[T] = object.__new__(target_type)
+        new._session = session
+        new._model = model
+        new._sa_entity = sa_entity
+        new._registry = dict(registry)
+        new._alias_name = alias_name
         new._select_entities = (
-            list(self._select_entities) if self._select_entities is not None else None
+            list(select_entities) if select_entities is not None else None
         )
-        new._where_clauses = list(self._where_clauses)
-        new._group_by_clauses = list(self._group_by_clauses)
-        new._having_clauses = list(self._having_clauses)
-        new._order_by_clauses = list(self._order_by_clauses)
-        new._joins = list(self._joins)
-        new._is_distinct = self._is_distinct
-        new._limit_val = self._limit_val
-        new._offset_val = self._offset_val
-        new._union_other = self._union_other
+        new._where_clauses = list(where_clauses)
+        new._group_by_clauses = list(group_by_clauses)
+        new._having_clauses = list(having_clauses)
+        new._order_by_clauses = list(order_by_clauses)
+        new._joins = list(joins)
+        new._is_distinct = is_distinct
+        new._limit_val = limit_val
+        new._offset_val = offset_val
         return new
 
-    def _as_subquery(self) -> Self:
+    @overload
+    def _clone(self) -> Self:  # type: ignore
+        pass
+
+    def _clone(self) -> "_DataFrameBase[T]":
+        """Return a deep copy of this object.
+
+        Returns
+        -------
+        _DataFrameBase[T]
+        """
+        return _DataFrameBase._factory(df=self)
+
+    @overload
+    def _as_subquery(self) -> Self:  # type: ignore
+        pass
+
+    def _as_subquery(self) -> "_DataFrameBase[T]":
         """Wrap the current query as a SQL subquery and return a fresh instance backed by it."""
         subq = self._build_query().subquery()
-        new: _DataFrameBase[T] = object.__new__(type(self))
-        new._session = self._session
-        new._model = self._model
-        new._sa_entity = subq
-        new._registry = {c.name: subq.c[c.name] for c in subq.columns}
-        new._alias_name = None
-        new._select_entities = None
-        new._where_clauses = []
-        new._group_by_clauses = []
-        new._having_clauses = []
-        new._order_by_clauses = []
-        new._joins = []
-        new._is_distinct = False
-        new._limit_val = None
-        new._offset_val = None
-        new._union_other = None
-        return new
+        return _DataFrameBase._factory(
+            target_type=type(self),
+            session=self._session,
+            model=self._model,
+            sa_entity=subq,
+            registry={c.name: subq.c[c.name] for c in subq.columns},
+        )
 
     @property
     def _is_async(self) -> bool:
@@ -280,25 +536,11 @@ class _DataFrameBase[T]:
             new._session = session
             return new
 
-        new: AsyncDataFrame[T] = object.__new__(AsyncDataFrame)
-        new._session = session
-        new._model = self._model
-        new._sa_entity = self._sa_entity
-        new._registry = self._registry.copy()
-        new._alias_name = self._alias_name
-        new._select_entities = (
-            list(self._select_entities) if self._select_entities is not None else None
+        return _DataFrameBase._factory(
+            df=self,
+            target_type=AsyncDataFrame,
+            session=session,
         )
-        new._where_clauses = list(self._where_clauses)
-        new._group_by_clauses = list(self._group_by_clauses)
-        new._having_clauses = list(self._having_clauses)
-        new._order_by_clauses = list(self._order_by_clauses)
-        new._joins = list(self._joins)
-        new._is_distinct = self._is_distinct
-        new._limit_val = self._limit_val
-        new._offset_val = self._offset_val
-        new._union_other = self._union_other
-        return new
 
     @overload
     def _create_async_clone_if_needed(self, other: "DataFrame[Any]") -> Self:
@@ -651,14 +893,19 @@ class _DataFrameBase[T]:
         list[SQLExpr]
         """
         if self._select_entities is None:
-            mapper = sa_inspect(self._model, raiseerr=True)
-            self._select_entities = [
-                getattr(self._sa_entity, a.key) for a in mapper.column_attrs
-            ]
-            for join_entity, _, _ in self._joins:
-                jmapper = sa_inspect(join_entity)
-                for a in jmapper.column_attrs:
-                    self._select_entities.append(getattr(join_entity, a.key))
+            if hasattr(self._sa_entity, "__table__") or hasattr(self._sa_entity, "__mapper__"):
+                # ORM model or aliased model — enumerate columns from the mapper
+                mapper = sa_inspect(self._model, raiseerr=True)
+                self._select_entities = [
+                    getattr(self._sa_entity, a.key) for a in mapper.column_attrs
+                ]
+                for join_entity, _, _ in self._joins:
+                    jmapper = sa_inspect(join_entity)
+                    for a in jmapper.column_attrs:
+                        self._select_entities.append(getattr(join_entity, a.key))
+            else:
+                # Subquery-backed entity (e.g. after union) — use registry
+                self._select_entities = [self._resolve(c) for c in self._registry]
         return self._select_entities
 
     @staticmethod
@@ -946,9 +1193,25 @@ class _DataFrameBase[T]:
         -------
         :class:`_DataFrameBase`
         """
-        new = self._create_async_clone_if_needed(other)
-        new._union_other = other
-        return new
+        left_stmt = self._build_query()
+        right_stmt = other._build_query()
+        subq = union_all(left_stmt, right_stmt).subquery()
+
+        # Determine the target type and session (async wins if either side is async)
+        if self._is_async or (not other._is_async):
+            target_type = type(self)
+            session = self._session
+        else:
+            target_type = type(other)
+            session = other._session
+
+        return _DataFrameBase._factory(
+            target_type=target_type,
+            session=session,
+            model=self._model,
+            sa_entity=subq,
+            registry={c.name: subq.c[c.name] for c in subq.columns},
+        )
 
     # -----
     # Query building
@@ -1006,11 +1269,6 @@ class _DataFrameBase[T]:
             stmt = stmt.limit(self._limit_val)
         if self._offset_val is not None:
             stmt = stmt.offset(self._offset_val)
-
-        # UNION
-        if self._union_other is not None:
-            other_stmt = self._union_other._build_query()
-            stmt = union_all(stmt, other_stmt)
 
         return stmt
 
@@ -1599,6 +1857,9 @@ class AsyncDataFrame[T](_DataFrameBase[T]):
         result = cast(CursorResult, await self._session.execute(stmt))
         await self._session.flush()
         return result.rowcount
+
+
+DFT = TypeVar("DFT", bound=DataFrame | AsyncDataFrame)
 
 
 def _maybe_register_label(registry: dict[str, "Any"], resolved: "SQLExpr"):

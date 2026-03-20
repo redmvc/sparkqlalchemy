@@ -6,7 +6,7 @@ translates correctly to SQLAlchemy and returns the expected results.
 
 Run with::
 
-    pytest tests/syntc_tests.py -v
+    pytest tests/sync_tests.py -v
 """
 
 from __future__ import annotations
@@ -812,6 +812,205 @@ class TestUnion:
         dept1 = DataFrame(session, Employee).where(F.col("department_id") == 1)
         dept2 = DataFrame(session, Employee).where(F.col("department_id") == 2)
         assert dept1.union(dept2).count() == 5  # 3 + 2
+
+    def test_three_way_union(self, session: Session):
+        """Chaining union() three times combines all rows."""
+        dept1 = (
+            DataFrame(session, Employee)
+            .where(F.col("department_id") == 1)
+            .select("first_name", "salary")
+        )
+        dept2 = (
+            DataFrame(session, Employee)
+            .where(F.col("department_id") == 2)
+            .select("first_name", "salary")
+        )
+        dept3 = (
+            DataFrame(session, Employee)
+            .where(F.col("department_id") == 3)
+            .select("first_name", "salary")
+        )
+        rows = dept1.union(dept2).union(dept3).collect()
+        assert len(rows) == 6  # 3 + 2 + 1
+
+    def test_union_then_where(self, session: Session):
+        """where() after union filters the combined result."""
+        dept1 = (
+            DataFrame(session, Employee)
+            .where(F.col("department_id") == 1)
+            .select("first_name", "salary")
+        )
+        dept2 = (
+            DataFrame(session, Employee)
+            .where(F.col("department_id") == 2)
+            .select("first_name", "salary")
+        )
+        rows = dept1.union(dept2).where(F.col("salary") > 100_000).collect()
+        # Dept 1: Alice (120k), Bob (110k), Frank (130k); Dept 2: Diana (105k)
+        assert len(rows) == 4
+
+    def test_union_then_order_by(self, session: Session):
+        """orderBy() after union sorts the combined result."""
+        dept1 = (
+            DataFrame(session, Employee)
+            .where(F.col("department_id") == 1)
+            .select("first_name", "salary")
+        )
+        dept2 = (
+            DataFrame(session, Employee)
+            .where(F.col("department_id") == 2)
+            .select("first_name", "salary")
+        )
+        rows = dept1.union(dept2).orderBy("salary").collect()
+        salaries = [r.salary for r in rows]
+        assert salaries == sorted(salaries)
+
+    def test_union_then_select(self, session: Session):
+        """select() after union projects the combined result."""
+        dept1 = (
+            DataFrame(session, Employee)
+            .where(F.col("department_id") == 1)
+            .select("first_name", "salary")
+        )
+        dept2 = (
+            DataFrame(session, Employee)
+            .where(F.col("department_id") == 2)
+            .select("first_name", "salary")
+        )
+        rows = dept1.union(dept2).select("first_name").collect()
+        assert len(rows) == 5
+        assert set(rows[0].asDict().keys()) == {"first_name"}
+
+    def test_union_then_limit(self, session: Session):
+        """limit() after union limits the combined result."""
+        dept1 = (
+            DataFrame(session, Employee)
+            .where(F.col("department_id") == 1)
+            .select("first_name", "salary")
+        )
+        dept2 = (
+            DataFrame(session, Employee)
+            .where(F.col("department_id") == 2)
+            .select("first_name", "salary")
+        )
+        rows = dept1.union(dept2).limit(3).collect()
+        assert len(rows) == 3
+
+    def test_union_then_group_by(self, session: Session):
+        """groupBy() after union aggregates the combined result."""
+        dept1 = (
+            DataFrame(session, Employee)
+            .where(F.col("department_id") == 1)
+            .select("department_id", "salary")
+        )
+        dept2 = (
+            DataFrame(session, Employee)
+            .where(F.col("department_id") == 2)
+            .select("department_id", "salary")
+        )
+        rows = (
+            dept1.union(dept2)
+            .groupBy("department_id")
+            .agg(F.sum("salary").alias("total"), F.count("*").alias("n"))
+            .orderBy("department_id")
+            .collect()
+        )
+        assert len(rows) == 2
+        assert rows[0].department_id == 1
+        assert rows[0].total == 360_000
+        assert rows[0].n == 3
+        assert rows[1].department_id == 2
+        assert rows[1].total == 200_000
+        assert rows[1].n == 2
+
+    def test_group_by_then_union_then_group_by(self, session: Session):
+        """Grouped DFs can be unioned and then re-grouped."""
+        dept1_agg = (
+            DataFrame(session, Employee)
+            .where(F.col("department_id") == 1)
+            .groupBy("department_id")
+            .agg(F.sum("salary").alias("total"))
+        )
+        dept2_agg = (
+            DataFrame(session, Employee)
+            .where(F.col("department_id") == 2)
+            .groupBy("department_id")
+            .agg(F.sum("salary").alias("total"))
+        )
+        rows = (
+            dept1_agg.union(dept2_agg)
+            .agg(F.sum("total").alias("grand_total"))
+            .collect()
+        )
+        assert len(rows) == 1
+        assert rows[0].grand_total == 560_000  # 360k + 200k
+
+    def test_union_then_distinct(self, session: Session):
+        """distinct() after union deduplicates the combined result."""
+        dept1 = (
+            DataFrame(session, Employee)
+            .where(F.col("department_id") == 1)
+            .select("department_id")
+        )
+        # Union with itself produces 6 rows (3 + 3), distinct should collapse to 1
+        rows = dept1.union(dept1).distinct().collect()
+        assert len(rows) == 1
+        assert rows[0].department_id == 1
+
+    def test_union_then_with_column(self, session: Session):
+        """withColumn() after union adds a computed column to the combined result."""
+        dept1 = (
+            DataFrame(session, Employee)
+            .where(F.col("department_id") == 1)
+            .select("first_name", "salary")
+        )
+        dept2 = (
+            DataFrame(session, Employee)
+            .where(F.col("department_id") == 2)
+            .select("first_name", "salary")
+        )
+        rows = (
+            dept1.union(dept2)
+            .withColumn("bonus", F.col("salary") * F.lit(0.1))
+            .orderBy("first_name")
+            .collect()
+        )
+        assert len(rows) == 5
+        assert set(rows[0].asDict().keys()) == {"first_name", "salary", "bonus"}
+        alice = next(r for r in rows if r.first_name == "Alice")
+        assert alice.bonus == 12_000.0  # 120k * 0.1
+
+    def test_union_does_not_mutate_inputs(self, session: Session):
+        """union() does not mutate either input DataFrame."""
+        a = DataFrame(session, Employee).where(F.col("department_id") == 1).select("first_name", "salary")
+        b = DataFrame(session, Employee).where(F.col("department_id") == 2).select("first_name", "salary")
+
+        a_cols_before = a.columns[:]
+        b_cols_before = b.columns[:]
+
+        _ = a.union(b)
+
+        assert a.columns == a_cols_before
+        assert b.columns == b_cols_before
+        assert a.count() == 3  # unchanged
+        assert b.count() == 2  # unchanged
+
+    def test_union_with_different_projections(self, session: Session):
+        """Union of DFs with matching column names but different source filters."""
+        high_earners = (
+            DataFrame(session, Employee)
+            .where(F.col("salary") > 120_000)
+            .select("first_name", "salary")
+        )
+        low_earners = (
+            DataFrame(session, Employee)
+            .where(F.col("salary") < 90_000)
+            .select("first_name", "salary")
+        )
+        rows = high_earners.union(low_earners).orderBy("salary").collect()
+        assert len(rows) == 2  # Eve (85k) and Frank (130k)
+        assert rows[0].first_name == "Eve"
+        assert rows[1].first_name == "Frank"
 
 
 class TestDistinctLimitOffset:

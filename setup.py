@@ -9,5 +9,6 @@ setup(
         "setuptools",
         "pandas",
         "sqlalchemy",
+        "typing_extensions",
     ],
 )

@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Self, cast
+from typing import TYPE_CHECKING, Self, cast, overload
 
 from sqlalchemy import CursorResult, and_, literal, union_all
 from sqlalchemy import delete as sa_delete
@@ -256,6 +256,89 @@ class _DataFrameBase[T]:
         new._limit_val = None
         new._offset_val = None
         new._union_other = None
+        return new
+
+    @property
+    def _is_async(self) -> bool:
+        return type(self) is AsyncDataFrame
+
+    def create_async_copy(self, session: AsyncSession) -> "AsyncDataFrame[T]":
+        """Return an async copy of this DataFrame. If it's already async, just clone it using the new session.
+
+        Parameters
+        ----------
+        session : :class:`~sqlalchemy.ext.asyncio.AsyncSession`
+            The asynchronous SQLAlchemy session to be used.
+
+        Returns
+        -------
+        AsyncDataFrame[T]
+        """
+        if self._is_async:
+            assert isinstance(self, AsyncDataFrame)
+            new = self._clone()
+            new._session = session
+            return new
+
+        new: AsyncDataFrame[T] = object.__new__(AsyncDataFrame)
+        new._session = session
+        new._model = self._model
+        new._sa_entity = self._sa_entity
+        new._registry = self._registry.copy()
+        new._alias_name = self._alias_name
+        new._select_entities = (
+            list(self._select_entities) if self._select_entities is not None else None
+        )
+        new._where_clauses = list(self._where_clauses)
+        new._group_by_clauses = list(self._group_by_clauses)
+        new._having_clauses = list(self._having_clauses)
+        new._order_by_clauses = list(self._order_by_clauses)
+        new._joins = list(self._joins)
+        new._is_distinct = self._is_distinct
+        new._limit_val = self._limit_val
+        new._offset_val = self._offset_val
+        new._union_other = self._union_other
+        return new
+
+    @overload
+    def _create_async_clone_if_needed(self, other: "DataFrame[Any]") -> Self:
+        pass
+
+    @overload
+    def _create_async_clone_if_needed(
+        self,
+        other: "AsyncDataFrame[Any]",
+    ) -> "AsyncDataFrame[T]":
+        pass
+
+    @overload
+    def _create_async_clone_if_needed(
+        self,
+        other: "_DataFrameBase[Any]",
+    ) -> "_DataFrameBase[T]":
+        pass
+
+    def _create_async_clone_if_needed(
+        self,
+        other: "_DataFrameBase[Any]",
+    ) -> "_DataFrameBase[T]":
+        """If this object is a sync DataFrame and `other` is an AsyncDataFrame, return an async copy of this object using `other`'s session; otherwise, return a copy of this object. Used by functions like `join` and `union`.
+
+        Parameters
+        ----------
+        other : _DataFrameBase[Any]
+            The other DataFrame to compare.
+
+        Returns
+        -------
+        _DataFrameBase[T]
+        """
+        if self._is_async or (not other._is_async):
+            new = self._clone()
+        else:
+            assert isinstance(other, AsyncDataFrame)
+            new = self.create_async_copy(other._session)
+
         return new
 
     def alias(self, name: str) -> Self:
@@ -670,12 +753,66 @@ class _DataFrameBase[T]:
 
         return new_df
 
+    @overload
+    def join(
+        self: "DataFrame[T]",
+        other: "DataFrame[T]",
+        on: Column | str | list[str] | None = None,
+        how: str = "inner",
+    ) -> "DataFrame[T]":
+        pass
+
+    @overload
+    def join(
+        self: "DataFrame[T]",
+        other: "DataFrame[Any]",
+        on: Column | str | list[str] | None = None,
+        how: str = "inner",
+    ) -> "DataFrame[Any]":
+        pass
+
+    @overload
+    def join(
+        self: "AsyncDataFrame[T]",
+        other: "DataFrame[T]",
+        on: Column | str | list[str] | None = None,
+        how: str = "inner",
+    ) -> "AsyncDataFrame[T]":
+        pass
+
+    @overload
+    def join(
+        self: "AsyncDataFrame[T]",
+        other: "DataFrame[Any]",
+        on: Column | str | list[str] | None = None,
+        how: str = "inner",
+    ) -> "AsyncDataFrame[Any]":
+        pass
+
+    @overload
+    def join(
+        self,
+        other: "AsyncDataFrame[T]",
+        on: Column | str | list[str] | None = None,
+        how: str = "inner",
+    ) -> "AsyncDataFrame[T]":
+        pass
+
+    @overload
+    def join(
+        self,
+        other: "AsyncDataFrame[Any]",
+        on: Column | str | list[str] | None = None,
+        how: str = "inner",
+    ) -> "AsyncDataFrame[Any]":
+        pass
+
     def join(
         self,
         other: "_DataFrameBase[Any]",
         on: Column | str | list[str] | None = None,
         how: str = "inner",
-    ) -> Self:
+    ) -> "_DataFrameBase[Any]":
         """Join with another :class:`_DataFrameBase` and return a new :class:`_DataFrameBase`.
 
         Parameters
@@ -691,7 +828,7 @@ class _DataFrameBase[T]:
         -------
         :class:`_DataFrameBase`
         """
-        new = self._clone()
+        new = self._create_async_clone_if_needed(other)
 
         # Auto-alias the right side for self-joins (same underlying model)
         # to prevent ambiguous column references.
@@ -770,7 +907,34 @@ class _DataFrameBase[T]:
         new._offset_val = n
         return new
 
-    def union(self, other: "_DataFrameBase[Any]") -> Self:
+    @overload
+    def union(self: "DataFrame[T]", other: "DataFrame[T]") -> "DataFrame[T]":
+        pass
+
+    @overload
+    def union(self: "DataFrame[T]", other: "DataFrame[Any]") -> "DataFrame[Any]":
+        pass
+
+    @overload
+    def union(self: "AsyncDataFrame[T]", other: "DataFrame[T]") -> "AsyncDataFrame[T]":
+        pass
+
+    @overload
+    def union(
+        self: "AsyncDataFrame[T]",
+        other: "DataFrame[Any]",
+    ) -> "AsyncDataFrame[Any]":
+        pass
+
+    @overload
+    def union(self, other: "AsyncDataFrame[T]") -> "AsyncDataFrame[T]":
+        pass
+
+    @overload
+    def union(self, other: "AsyncDataFrame[Any]") -> "AsyncDataFrame[Any]":
+        pass
+
+    def union(self, other: "_DataFrameBase[Any]") -> "_DataFrameBase[Any]":
         """Combine two DataFrames with `UNION ALL` and return a new :class:`_DataFrameBase`. Both DataFrames must produce the same columns.
 
         Parameters
@@ -782,7 +946,7 @@ class _DataFrameBase[T]:
         -------
         :class:`_DataFrameBase`
         """
-        new = self._clone()
+        new = self._create_async_clone_if_needed(other)
         new._union_other = other
         return new
 

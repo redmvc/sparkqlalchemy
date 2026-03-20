@@ -651,7 +651,9 @@ class _DataFrameBase[T]:
         keys_to_remove: set[str] = set()
         for key in new._registry:
             if key in base_col_names:
-                keys_to_remove.add(key)
+                # Preserve withColumn-computed labels; only remove raw column refs
+                if not isinstance(new._registry[key], Label):
+                    keys_to_remove.add(key)
             elif old_prefix and key.startswith(old_prefix):
                 keys_to_remove.add(key)
         for key in keys_to_remove:
@@ -662,10 +664,14 @@ class _DataFrameBase[T]:
         for key in list(new._registry.keys()):
             new._registry[key] = _adapt(new._registry[key])
 
-        # Re-register base-model columns from the new aliased entity
+        # Re-register base-model columns from the new aliased entity.
+        # Skip bare-name registration if a withColumn-computed label
+        # already occupies that key (it should take precedence).
         for attr in mapper.column_attrs:
             sa_col = getattr(sa_alias, attr.key)
-            new._registry[attr.key] = sa_col  # bare: "salary"
+            existing = new._registry.get(attr.key)
+            if not isinstance(existing, Label):
+                new._registry[attr.key] = sa_col  # bare: "salary"
             new._registry[f"{name}.{attr.key}"] = sa_col  # dotted: "a.salary"
 
         return new
@@ -787,7 +793,7 @@ class _DataFrameBase[T]:
         :class:`GroupedData`
         """
         # If already aggregated, wrap in a subquery first
-        df = self._as_subquery() if self._group_by_clauses else self
+        df = self._subquery_if_grouped()
         group_exprs = [df._resolve(c) for c in cols]
         return GroupedData(df, group_exprs)
 
@@ -806,6 +812,15 @@ class _DataFrameBase[T]:
         :class:`GroupedData`
         """
         return self.groupBy(*cols)
+
+    def _subquery_if_grouped(self) -> Self:
+        """Return this query as a subquery in case it is in a group by.
+
+        Returns
+        -------
+        Self
+        """
+        return self._as_subquery() if self._group_by_clauses else self
 
     def _build_agg(
         self,
@@ -893,7 +908,9 @@ class _DataFrameBase[T]:
         list[SQLExpr]
         """
         if self._select_entities is None:
-            if hasattr(self._sa_entity, "__table__") or hasattr(self._sa_entity, "__mapper__"):
+            if hasattr(self._sa_entity, "__table__") or hasattr(
+                self._sa_entity, "__mapper__"
+            ):
                 # ORM model or aliased model — enumerate columns from the mapper
                 mapper = sa_inspect(self._model, raiseerr=True)
                 self._select_entities = [
@@ -1075,38 +1092,49 @@ class _DataFrameBase[T]:
         -------
         :class:`_DataFrameBase`
         """
-        new = self._create_async_clone_if_needed(other)
+        # If joining grouped queries they should be subqueried first
+        new = self._subquery_if_grouped()._create_async_clone_if_needed(other)
+        _other = other._subquery_if_grouped()
 
         # Auto-alias the right side for self-joins (same underlying model)
-        # to prevent ambiguous column references.
-        if other._model is self._model and other._alias_name is None:
+        # to prevent ambiguous column references.  Skip when either side is
+        # backed by a subquery — subqueries are already distinct.
+        def _is_orm_entity(entity: "Any") -> bool:
+            return hasattr(entity, "__table__") or hasattr(entity, "__mapper__")
+
+        if (
+            _other._model is self._model
+            and _other._alias_name is None
+            and _is_orm_entity(new._sa_entity)
+            and _is_orm_entity(_other._sa_entity)
+        ):
             # Pick a name that won't collide with an existing alias
-            auto_name = f"_{other._model.__name__.lower()}_2"
-            other = other.alias(auto_name)
+            auto_name = f"_{_other._model.__name__.lower()}_2"
+            _other = _other.alias(auto_name)
 
         # Build a combined registry for resolving the ON clause.
         # Dot-prefixed entries (from aliases) are included automatically.
-        combined_registry = {**new._registry, **other._registry}
+        combined_registry = {**new._registry, **_other._registry}
 
         # Resolve the join condition
         if isinstance(on, str):
             # Single column name equi-join.  Look up the bare name in each
             # side's own registry (so aliased names don't collide).
-            left_expr = self._resolve(on)
-            right_expr = other._resolve(on)
+            left_expr = new._resolve(on)
+            right_expr = _other._resolve(on)
             join_cond = left_expr == right_expr
         elif isinstance(on, (list, tuple)):
-            parts = [self._resolve(c) == other._resolve(c) for c in on]
+            parts = [new._resolve(c) == _other._resolve(c) for c in on]
             join_cond = and_(*parts)
         elif isinstance(on, Column):
             join_cond = on.resolve(combined_registry)
         else:
             join_cond = on  # raw SA expression or None (cross join)
 
-        new._joins.append((other._sa_entity, join_cond, how.lower()))
+        new._joins.append((_other._sa_entity, join_cond, how.lower()))
 
         # Merge the right-side registry into the new DataFrame's registry
-        for key, val in other._registry.items():
+        for key, val in _other._registry.items():
             new._registry[key] = val
 
         return new
@@ -1221,6 +1249,9 @@ class _DataFrameBase[T]:
         # Determine SELECT entities
         if self._select_entities is not None:
             entities = list(self._select_entities)
+        elif self._joins:
+            # Include all columns from both sides, matching PySpark semantics
+            entities = [self._resolve(c) for c in self._registry]
         else:
             entities = [self._sa_entity]
 

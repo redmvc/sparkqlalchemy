@@ -880,6 +880,83 @@ class TestJoin:
         assert rows[2].headcount == 1
         assert rows[2].total_salary == 85_000
 
+    def test_select_then_join(self, session: Session):
+        """select() before join still includes right-side columns in the result."""
+        emp_df = DataFrame(session, Employee).select("first_name", "department_id")
+        dept_df = DataFrame(session, Department)
+
+        rows = (
+            emp_df.join(dept_df, emp_df["department_id"] == dept_df["id"], "inner")
+            .where(F.col("first_name") == "Alice")
+            .collect()
+        )
+        assert len(rows) == 1
+        keys = set(rows[0].asDict().keys())
+        # Left side selected: first_name, department_id
+        assert "first_name" in keys
+        assert "department_id" in keys
+        # Right side should be included automatically: id, name, budget
+        assert "name" in keys
+        assert "budget" in keys
+
+    def test_select_then_join_both_selected(self, session: Session):
+        """Both sides with select() before join — result has both projections."""
+        emp_df = DataFrame(session, Employee).select("first_name", "department_id")
+        dept_df = DataFrame(session, Department).select("id", "name")
+
+        rows = (
+            emp_df.join(dept_df, emp_df["department_id"] == dept_df["id"], "inner")
+            .where(F.col("first_name") == "Alice")
+            .collect()
+        )
+        assert len(rows) == 1
+        keys = set(rows[0].asDict().keys())
+        assert keys == {"first_name", "department_id", "id", "name"}
+
+    def test_three_way_join_without_explicit_select(self, session: Session):
+        """Three tables joined with no select() — all columns from all three appear."""
+        e = DataFrame(session, Employee).alias("e")
+        d = DataFrame(session, Department).alias("d")
+        e2 = DataFrame(session, Employee).alias("e2")
+
+        rows = (
+            e.join(d, F.col("e.department_id") == F.col("d.id"), "inner")
+            .join(e2, F.col("e.department_id") == F.col("e2.department_id"), "inner")
+            .where(
+                (F.col("e.first_name") == "Alice") & (F.col("e2.first_name") == "Bob")
+            )
+            .collect()
+        )
+        assert len(rows) == 1
+        keys = set(rows[0].asDict().keys())
+        # Should have columns from all three registries
+        assert "e.first_name" in keys or "first_name" in keys
+        assert "d.name" in keys or "name" in keys
+
+    def test_three_way_join_with_select_before_second_join(self, session: Session):
+        """select() between joins — third table's columns still appear."""
+        emp_df = DataFrame(session, Employee)
+        dept_df = DataFrame(session, Department)
+
+        rows = (
+            emp_df.join(dept_df, emp_df["department_id"] == dept_df["id"], "inner")
+            .select("first_name", "name")
+            .join(
+                DataFrame(session, Department).alias("d2"),
+                emp_df["department_id"] == F.col("d2.id"),
+                "inner",
+            )
+            .where(F.col("first_name") == "Alice")
+            .collect()
+        )
+        assert len(rows) == 1
+        keys = set(rows[0].asDict().keys())
+        # Selected from first join: first_name, name
+        assert "first_name" in keys
+        assert "name" in keys
+        # Third table (d2) columns should also appear
+        assert "d2.name" in keys or "budget" in keys
+
 
 class TestUnion:
     def test_union_combines_rows(self, session: Session):

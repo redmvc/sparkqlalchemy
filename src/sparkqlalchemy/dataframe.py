@@ -1137,6 +1137,16 @@ class _DataFrameBase[T]:
         for key, val in _other._registry.items():
             new._registry[key] = val
 
+        # If an explicit select() was called before the join, append the
+        # right side's columns so they appear in the result automatically.
+        # Respect the right side's own select() if it has one.
+        if new._select_entities is not None:
+            if _other._select_entities is not None:
+                new._select_entities.extend(_other._select_entities)
+            else:
+                for key in _other._registry:
+                    new._select_entities.append(new._resolve(key))
+
         return new
 
     def distinct(self) -> Self:

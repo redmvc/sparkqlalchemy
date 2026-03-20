@@ -53,8 +53,7 @@ def sum(column: str | Column) -> Column:
     :class:`Column`
     """
     c = _to_col(column)
-    parent = c._resolver
-    return Column(lambda reg: sa_func.sum(parent(reg)), f"sum({c._name})")
+    return Column(lambda reg: sa_func.sum(c._resolver(reg)), f"sum({c._name})")
 
 
 def avg(column: str | Column) -> Column:
@@ -70,8 +69,7 @@ def avg(column: str | Column) -> Column:
     :class:`Column`
     """
     c = _to_col(column)
-    parent = c._resolver
-    return Column(lambda reg: sa_func.avg(parent(reg)), f"avg({c._name})")
+    return Column(lambda reg: sa_func.avg(c._resolver(reg)), f"avg({c._name})")
 
 
 def mean(column: str | Column) -> Column:
@@ -107,8 +105,7 @@ def count(column: str | Column = "*") -> Column:
     if isinstance(column, str) and column == "*":
         return Column(lambda _: sa_func.count(), "count(1)")
     c = _to_col(column)
-    parent = c._resolver
-    return Column(lambda reg: sa_func.count(parent(reg)), f"count({c._name})")
+    return Column(lambda reg: sa_func.count(c._resolver(reg)), f"count({c._name})")
 
 
 def countDistinct(column: str | Column) -> Column:
@@ -124,9 +121,8 @@ def countDistinct(column: str | Column) -> Column:
     :class:`Column`
     """
     c = _to_col(column)
-    parent = c._resolver
     return Column(
-        lambda reg: sa_func.count(sa_func.distinct(parent(reg))),
+        lambda reg: sa_func.count(sa_func.distinct(c._resolver(reg))),
         f"count_distinct({c._name})",
     )
 
@@ -161,8 +157,7 @@ def max(column: str | Column) -> Column:
     :class:`Column`
     """
     c = _to_col(column)
-    parent = c._resolver
-    return Column(lambda reg: sa_func.max(parent(reg)), f"max({c._name})")
+    return Column(lambda reg: sa_func.max(c._resolver(reg)), f"max({c._name})")
 
 
 def min(column: str | Column) -> Column:
@@ -178,8 +173,7 @@ def min(column: str | Column) -> Column:
     :class:`Column`
     """
     c = _to_col(column)
-    parent = c._resolver
-    return Column(lambda reg: sa_func.min(parent(reg)), f"min({c._name})")
+    return Column(lambda reg: sa_func.min(c._resolver(reg)), f"min({c._name})")
 
 
 def first(column: str | Column) -> Column:
@@ -197,8 +191,7 @@ def first(column: str | Column) -> Column:
     :class:`Column`
     """
     c = _to_col(column)
-    parent = c._resolver
-    return Column(lambda reg: sa_func.any_value(parent(reg)), f"first({c._name})")
+    return Column(lambda reg: sa_func.any_value(c._resolver(reg)), f"first({c._name})")
 
 
 def max_by(column: str | Column, ord_column: str | Column) -> Column:
@@ -312,8 +305,7 @@ def upper(column: str | Column) -> Column:
     :class:`Column`
     """
     c = _to_col(column)
-    parent = c._resolver
-    return Column(lambda reg: sa_func.upper(parent(reg)), f"upper({c._name})")
+    return Column(lambda reg: sa_func.upper(c._resolver(reg)), f"upper({c._name})")
 
 
 def lower(column: str | Column) -> Column:
@@ -329,8 +321,7 @@ def lower(column: str | Column) -> Column:
     :class:`Column`
     """
     c = _to_col(column)
-    parent = c._resolver
-    return Column(lambda reg: sa_func.lower(parent(reg)), f"lower({c._name})")
+    return Column(lambda reg: sa_func.lower(c._resolver(reg)), f"lower({c._name})")
 
 
 def length(column: str | Column) -> Column:
@@ -346,8 +337,7 @@ def length(column: str | Column) -> Column:
     :class:`Column`
     """
     c = _to_col(column)
-    parent = c._resolver
-    return Column(lambda reg: sa_func.length(parent(reg)), f"length({c._name})")
+    return Column(lambda reg: sa_func.length(c._resolver(reg)), f"length({c._name})")
 
 
 def trim(column: str | Column) -> Column:
@@ -363,8 +353,7 @@ def trim(column: str | Column) -> Column:
     :class:`Column`
     """
     c = _to_col(column)
-    parent = c._resolver
-    return Column(lambda reg: sa_func.trim(parent(reg)), f"trim({c._name})")
+    return Column(lambda reg: sa_func.trim(c._resolver(reg)), f"trim({c._name})")
 
 
 def abs(column: str | Column) -> Column:
@@ -380,8 +369,7 @@ def abs(column: str | Column) -> Column:
     :class:`Column`
     """
     c = _to_col(column)
-    parent = c._resolver
-    return Column(lambda reg: sa_func.abs(parent(reg)), f"abs({c._name})")
+    return Column(lambda reg: sa_func.abs(c._resolver(reg)), f"abs({c._name})")
 
 
 def round(column: str | Column, scale: int = 0) -> Column:
@@ -399,8 +387,9 @@ def round(column: str | Column, scale: int = 0) -> Column:
     :class:`Column`
     """
     c = _to_col(column)
-    parent = c._resolver
-    return Column(lambda reg: sa_func.round(parent(reg), scale), f"round({c._name})")
+    return Column(
+        lambda reg: sa_func.round(c._resolver(reg), scale), f"round({c._name})"
+    )
 
 
 def when(condition: Column, value: "Any") -> "WhenExpr":

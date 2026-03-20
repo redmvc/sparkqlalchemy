@@ -651,7 +651,9 @@ class _DataFrameBase[T]:
         keys_to_remove: set[str] = set()
         for key in new._registry:
             if key in base_col_names:
-                keys_to_remove.add(key)
+                # Preserve withColumn-computed labels; only remove raw column refs
+                if not isinstance(new._registry[key], Label):
+                    keys_to_remove.add(key)
             elif old_prefix and key.startswith(old_prefix):
                 keys_to_remove.add(key)
         for key in keys_to_remove:
@@ -662,10 +664,14 @@ class _DataFrameBase[T]:
         for key in list(new._registry.keys()):
             new._registry[key] = _adapt(new._registry[key])
 
-        # Re-register base-model columns from the new aliased entity
+        # Re-register base-model columns from the new aliased entity.
+        # Skip bare-name registration if a withColumn-computed label
+        # already occupies that key (it should take precedence).
         for attr in mapper.column_attrs:
             sa_col = getattr(sa_alias, attr.key)
-            new._registry[attr.key] = sa_col  # bare: "salary"
+            existing = new._registry.get(attr.key)
+            if not isinstance(existing, Label):
+                new._registry[attr.key] = sa_col  # bare: "salary"
             new._registry[f"{name}.{attr.key}"] = sa_col  # dotted: "a.salary"
 
         return new

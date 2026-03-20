@@ -14,9 +14,10 @@ from __future__ import annotations
 import os
 import sqlite3
 import sys
+from datetime import date
 
 import pytest
-from sqlalchemy import Column, Float, ForeignKey, Integer, String, create_engine
+from sqlalchemy import Column, Date, Float, ForeignKey, Integer, String, create_engine
 from sqlalchemy.orm import DeclarativeBase, Session
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -52,6 +53,9 @@ class Employee(Base):
     last_name = Column(String(50), nullable=False)
     department_id = Column(Integer, ForeignKey("departments.id"))
     salary = Column(Float, nullable=False)
+    bonus = Column(Float, nullable=True)
+    hire_date = Column(Date, nullable=True)
+    review_date = Column(Date, nullable=True)
     status = Column(String(20), default="active")
 
 
@@ -81,6 +85,9 @@ def session():
                 last_name="Smith",
                 department_id=1,
                 salary=120_000,
+                bonus=15_000,
+                hire_date=date(2020, 3, 15),
+                review_date=date(2024, 6, 1),
                 status="active",
             ),
             Employee(
@@ -89,6 +96,9 @@ def session():
                 last_name="Jones",
                 department_id=1,
                 salary=110_000,
+                bonus=8_000,
+                hire_date=date(2021, 7, 1),
+                review_date=date(2023, 12, 15),
                 status="active",
             ),
             Employee(
@@ -97,6 +107,9 @@ def session():
                 last_name="Brown",
                 department_id=2,
                 salary=95_000,
+                bonus=None,
+                hire_date=date(2019, 1, 10),
+                review_date=None,
                 status="active",
             ),
             Employee(
@@ -105,6 +118,9 @@ def session():
                 last_name="Prince",
                 department_id=2,
                 salary=105_000,
+                bonus=12_000,
+                hire_date=date(2022, 11, 20),
+                review_date=date(2025, 1, 10),
                 status="inactive",
             ),
             Employee(
@@ -113,6 +129,9 @@ def session():
                 last_name="Adams",
                 department_id=3,
                 salary=85_000,
+                bonus=None,
+                hire_date=date(2023, 5, 5),
+                review_date=None,
                 status="active",
             ),
             Employee(
@@ -121,6 +140,9 @@ def session():
                 last_name="Miller",
                 department_id=1,
                 salary=130_000,
+                bonus=20_000,
+                hire_date=date(2018, 9, 1),
+                review_date=date(2024, 3, 20),
                 status="active",
             ),
         ]
@@ -1499,6 +1521,173 @@ class TestFunctions:
         df = DataFrame(session, Employee)
         rows = df.agg(F.count_distinct("department_id").alias("n_depts")).collect()
         assert rows[0].n_depts == 3
+
+    def test_greatest_numeric(self, session: Session):
+        """greatest() returns the largest value among numeric columns."""
+        df = DataFrame(session, Employee)
+        rows = (
+            df.select(
+                "first_name",
+                F.greatest("salary", "bonus").alias("higher"),
+            )
+            .where(F.col("first_name") == "Alice")
+            .collect()
+        )
+        # Alice: salary=120k, bonus=15k → greatest = 120k
+        assert rows[0].higher == 120_000
+
+    def test_greatest_with_null(self, session: Session):
+        """greatest() ignores NULL — returns the non-null value."""
+        df = DataFrame(session, Employee)
+        rows = (
+            df.select(
+                "first_name",
+                F.greatest("salary", "bonus").alias("higher"),
+            )
+            .where(F.col("first_name") == "Charlie")
+            .collect()
+        )
+        # Charlie: salary=95k, bonus=NULL → greatest = 95k
+        assert rows[0].higher == 95_000
+
+    def test_greatest_dates(self, session: Session):
+        """greatest() works with date columns."""
+        df = DataFrame(session, Employee)
+        rows = (
+            df.select(
+                "first_name",
+                F.greatest("hire_date", "review_date").alias("latest"),
+            )
+            .where(F.col("first_name") == "Alice")
+            .collect()
+        )
+        # Alice: hire_date=2020-03-15, review_date=2024-06-01 → latest = 2024-06-01
+        assert rows[0].latest == date(2024, 6, 1)
+
+    def test_least_numeric(self, session: Session):
+        """least() returns the smallest value among numeric columns."""
+        df = DataFrame(session, Employee)
+        rows = (
+            df.select(
+                "first_name",
+                F.least("salary", "bonus").alias("lower"),
+            )
+            .where(F.col("first_name") == "Alice")
+            .collect()
+        )
+        # Alice: salary=120k, bonus=15k → least = 15k
+        assert rows[0].lower == 15_000
+
+    def test_least_with_null(self, session: Session):
+        """least() ignores NULL — returns the non-null value."""
+        df = DataFrame(session, Employee)
+        rows = (
+            df.select(
+                "first_name",
+                F.least("salary", "bonus").alias("lower"),
+            )
+            .where(F.col("first_name") == "Eve")
+            .collect()
+        )
+        # Eve: salary=85k, bonus=NULL → least = 85k
+        assert rows[0].lower == 85_000
+
+    def test_least_dates(self, session: Session):
+        """least() works with date columns."""
+        df = DataFrame(session, Employee)
+        rows = (
+            df.select(
+                "first_name",
+                F.least("hire_date", "review_date").alias("earliest"),
+            )
+            .where(F.col("first_name") == "Bob")
+            .collect()
+        )
+        # Bob: hire_date=2021-07-01, review_date=2023-12-15 → earliest = 2021-07-01
+        assert rows[0].earliest == date(2021, 7, 1)
+
+    def test_greatest_all_null(self, session: Session):
+        """greatest() returns NULL when all inputs are NULL."""
+        df = DataFrame(session, Employee)
+        rows = (
+            df.select(
+                "first_name",
+                F.greatest("bonus", "bonus").alias("result"),
+            )
+            .where(F.col("first_name") == "Charlie")
+            .collect()
+        )
+        # Charlie: bonus=NULL, bonus=NULL → NULL
+        assert rows[0].result is None
+
+    def test_least_all_null(self, session: Session):
+        """least() returns NULL when all inputs are NULL."""
+        df = DataFrame(session, Employee)
+        rows = (
+            df.select(
+                "first_name",
+                F.least("bonus", "bonus").alias("result"),
+            )
+            .where(F.col("first_name") == "Charlie")
+            .collect()
+        )
+        assert rows[0].result is None
+
+    def test_greatest_three_columns(self, session: Session):
+        """greatest() with three numeric arguments returns the largest."""
+        df = DataFrame(session, Employee)
+        rows = (
+            df.select(
+                "first_name",
+                F.greatest("salary", "bonus", F.lit(100_000)).alias("top"),
+            )
+            .where(F.col("first_name") == "Alice")
+            .collect()
+        )
+        # Alice: salary=120k, bonus=15k, lit=100k → 120k
+        assert rows[0].top == 120_000
+
+    def test_greatest_three_columns_with_nulls(self, session: Session):
+        """greatest() with three columns skips NULLs and returns the max of the rest."""
+        df = DataFrame(session, Employee)
+        rows = (
+            df.select(
+                "first_name",
+                F.greatest("salary", "bonus", F.lit(100_000)).alias("top"),
+            )
+            .where(F.col("first_name") == "Charlie")
+            .collect()
+        )
+        # Charlie: salary=95k, bonus=NULL, lit=100k → 100k (NULL skipped)
+        assert rows[0].top == 100_000
+
+    def test_least_three_columns(self, session: Session):
+        """least() with three numeric arguments returns the smallest."""
+        df = DataFrame(session, Employee)
+        rows = (
+            df.select(
+                "first_name",
+                F.least("salary", "bonus", F.lit(100_000)).alias("bottom"),
+            )
+            .where(F.col("first_name") == "Alice")
+            .collect()
+        )
+        # Alice: salary=120k, bonus=15k, lit=100k → 15k
+        assert rows[0].bottom == 15_000
+
+    def test_least_three_columns_with_nulls(self, session: Session):
+        """least() with three columns skips NULLs and returns the min of the rest."""
+        df = DataFrame(session, Employee)
+        rows = (
+            df.select(
+                "first_name",
+                F.least("salary", "bonus", F.lit(100_000)).alias("bottom"),
+            )
+            .where(F.col("first_name") == "Eve")
+            .collect()
+        )
+        # Eve: salary=85k, bonus=NULL, lit=100k → 85k (NULL skipped)
+        assert rows[0].bottom == 85_000
 
 
 class TestAlias:

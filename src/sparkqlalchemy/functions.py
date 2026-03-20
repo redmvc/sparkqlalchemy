@@ -1,5 +1,7 @@
+from functools import reduce
 from typing import TYPE_CHECKING
 
+from sqlalchemy import case as sa_case
 from sqlalchemy import func as sa_func
 from sqlalchemy import literal
 
@@ -8,6 +10,8 @@ from .column import Column, WhenExpr, _to_col
 
 if TYPE_CHECKING:
     from typing import Any
+
+    from .column import SQLExpr, _ColumnRegistry
 
 
 def col(name: str) -> Column:
@@ -389,6 +393,74 @@ def round(column: str | Column, scale: int = 0) -> Column:
     c = _to_col(column)
     return Column(
         lambda reg: sa_func.round(c._resolver(reg), scale), f"round({c._name})"
+    )
+
+
+def greatest(*columns: str | Column) -> Column:
+    """Return a :class:`Column` that evaluates to the largest value among `columns`.
+
+    NULL values are ignored — the result is NULL only if all inputs are NULL.
+
+    Parameters
+    ----------
+    *columns : str | :class:`Column`
+        Two or more columns to compare.
+
+    Returns
+    -------
+    :class:`Column`
+    """
+    cols = [_to_col(c) for c in columns]
+    resolvers = [c._resolver for c in cols]
+
+    def _resolve(reg: "_ColumnRegistry") -> "SQLExpr":
+        resolved = [r(reg) for r in resolvers]
+        return reduce(_nullsafe_greatest, resolved)
+
+    return Column(_resolve, "greatest(...)")
+
+
+def least(*columns: str | Column) -> Column:
+    """Return a :class:`Column` that evaluates to the smallest value among `columns`.
+
+    NULL values are ignored — the result is NULL only if all inputs are NULL.
+
+    Parameters
+    ----------
+    *columns : str | :class:`Column`
+        Two or more columns to compare.
+
+    Returns
+    -------
+    :class:`Column`
+    """
+    cols = [_to_col(c) for c in columns]
+    resolvers = [c._resolver for c in cols]
+
+    def _resolve(reg: "_ColumnRegistry") -> "SQLExpr":
+        resolved = [r(reg) for r in resolvers]
+        return reduce(_nullsafe_least, resolved)
+
+    return Column(_resolve, "least(...)")
+
+
+def _nullsafe_greatest(a: "Any", b: "Any") -> "Any":
+    """Return a CASE expression: greatest of a and b, skipping NULLs."""
+    return sa_case(
+        (a.is_(None), b),
+        (b.is_(None), a),
+        (a >= b, a),
+        else_=b,
+    )
+
+
+def _nullsafe_least(a: "Any", b: "Any") -> "Any":
+    """Return a CASE expression: least of a and b, skipping NULLs."""
+    return sa_case(
+        (a.is_(None), b),
+        (b.is_(None), a),
+        (a <= b, a),
+        else_=b,
     )
 
 

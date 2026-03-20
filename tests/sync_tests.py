@@ -780,6 +780,84 @@ class TestJoin:
         # Engineering has Alice, Bob, Frank (3 people) → 3 × 3 = 9 ordered pairs
         assert len(rows) == 9
 
+    def test_join_left_grouped(self, session: Session):
+        """Joining a grouped DF (left) with a plain DF (right) works."""
+        emp_agg = (
+            DataFrame(session, Employee)
+            .groupBy("department_id")
+            .agg(F.sum("salary").alias("total_salary"))
+        )
+        dept_df = DataFrame(session, Department)
+
+        rows = (
+            emp_agg.join(
+                dept_df,
+                F.col("department_id") == dept_df["id"],
+                "inner",
+            )
+            .select("name", "total_salary")
+            .orderBy("total_salary")
+            .collect()
+        )
+        assert len(rows) == 3
+        assert rows[0].name == "HR"
+        assert rows[0].total_salary == 85_000
+        assert rows[2].name == "Engineering"
+        assert rows[2].total_salary == 360_000
+
+    def test_join_right_grouped(self, session: Session):
+        """Joining a plain DF (left) with a grouped DF (right) works."""
+        dept_df = DataFrame(session, Department)
+        emp_agg = (
+            DataFrame(session, Employee)
+            .groupBy("department_id")
+            .agg(F.sum("salary").alias("total_salary"))
+        )
+
+        rows = (
+            dept_df.join(
+                emp_agg,
+                dept_df["id"] == F.col("department_id"),
+                "inner",
+            )
+            .select("name", "total_salary")
+            .orderBy("total_salary")
+            .collect()
+        )
+        assert len(rows) == 3
+        assert rows[0].name == "HR"
+        assert rows[0].total_salary == 85_000
+
+    def test_join_both_grouped(self, session: Session):
+        """Joining two grouped DFs works."""
+        emp_count = (
+            DataFrame(session, Employee)
+            .groupBy("department_id")
+            .agg(F.count("*").alias("headcount"))
+        )
+        emp_salary = (
+            DataFrame(session, Employee)
+            .groupBy("department_id")
+            .agg(F.sum("salary").alias("total_salary"))
+        )
+
+        rows = (
+            emp_count.join(
+                emp_salary,
+                "department_id",
+                "inner",
+            )
+            .orderBy("department_id")
+            .collect()
+        )
+        assert len(rows) == 3
+        assert rows[0].headcount == 3
+        assert rows[0].total_salary == 360_000
+        assert rows[1].headcount == 2
+        assert rows[1].total_salary == 200_000
+        assert rows[2].headcount == 1
+        assert rows[2].total_salary == 85_000
+
 
 class TestUnion:
     def test_union_combines_rows(self, session: Session):
@@ -982,8 +1060,16 @@ class TestUnion:
 
     def test_union_does_not_mutate_inputs(self, session: Session):
         """union() does not mutate either input DataFrame."""
-        a = DataFrame(session, Employee).where(F.col("department_id") == 1).select("first_name", "salary")
-        b = DataFrame(session, Employee).where(F.col("department_id") == 2).select("first_name", "salary")
+        a = (
+            DataFrame(session, Employee)
+            .where(F.col("department_id") == 1)
+            .select("first_name", "salary")
+        )
+        b = (
+            DataFrame(session, Employee)
+            .where(F.col("department_id") == 2)
+            .select("first_name", "salary")
+        )
 
         a_cols_before = a.columns[:]
         b_cols_before = b.columns[:]

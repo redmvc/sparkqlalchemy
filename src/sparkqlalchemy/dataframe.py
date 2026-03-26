@@ -1093,8 +1093,8 @@ class _DataFrameBase[T]:
         :class:`_DataFrameBase`
         """
         # If joining grouped queries they should be subqueried first
-        new = self._subquery_if_grouped()._create_async_clone_if_needed(other)
-        _other = other._subquery_if_grouped()
+        new = self._as_subquery()._create_async_clone_if_needed(other)
+        _other = other._as_subquery()
 
         # Auto-alias the right side for self-joins (same underlying model)
         # to prevent ambiguous column references.  Skip when either side is
